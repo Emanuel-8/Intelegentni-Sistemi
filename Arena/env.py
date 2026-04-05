@@ -14,3 +14,5 @@ class Arenaenv:
 
     def get_state(self):
         return [self.player.x, self.player.y, self.player.stamina]
+        ##add positioning
+        
