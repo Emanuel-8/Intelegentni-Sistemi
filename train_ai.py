@@ -1,5 +1,0 @@
-pygame
-numpy
-gymnasium
-stable-baselines3[extra]
-torch
