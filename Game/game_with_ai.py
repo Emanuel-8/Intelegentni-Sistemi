@@ -1040,16 +1040,21 @@ def draw_game_hud(screen, p1, p2, arena, tick, BODY_FONT, SMALL_FONT, TINY_FONT)
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_FILENAME = "p2_ai"
+MODEL_FILEPATH = os.path.join(SCRIPT_DIR, MODEL_FILENAME + ".zip")
+
 def main():
     # ── Load trained AI model ────────────────────────────────────
-    if not os.path.exists("p2_ai.zip"):
+    if not os.path.exists(MODEL_FILEPATH):
         print("=" * 58)
         print("  ERROR: p2_ai.zip not found!")
+        print(f"  Expected: {MODEL_FILEPATH}")
         print("  Please run  python train_ai.py  first.")
         print("=" * 58)
         return
     print("Loading AI model for Player 2…")
-    model = PPO.load("p2_ai")
+    model = PPO.load(os.path.join(SCRIPT_DIR, MODEL_FILENAME))
     print("AI ready! Starting game…\n")
 
     pygame.init()
