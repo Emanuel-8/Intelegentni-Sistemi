@@ -1,0 +1,5 @@
+# Extra packages needed only to TRAIN a new AI (python train_ai.py)
+-r requirements.txt
+gymnasium
+stable-baselines3[extra]
+torch

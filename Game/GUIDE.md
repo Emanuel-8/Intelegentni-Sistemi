@@ -29,20 +29,23 @@ OpenAI Five, AlphaStar, and many others.
 ## Files Overview
 
 ```
-your-game-folder/
+Game/
 │
-├── game.py            ← Your ORIGINAL game (don't change this)
-├── game_with_ai.py    ← Modified game where P2 is the AI
+├── game.py              ← The game (all modes: vs AI, local 2P, AI vs AI, online)
+├── game_with_ai.py      ← Shortcut: starts straight into a match vs the AI
 │
-├── ai_helpers.py      ← Converts game state → numbers the AI understands
-├── game_env.py        ← The training arena (game without graphics)
-├── train_ai.py        ← Run this to train the AI
+├── ai_helpers.py        ← Converts game state → numbers the AI understands
+├── ai_player.py         ← Runs the trained network in the game (numpy) + difficulty levels
+├── game_env.py          ← The training arena (game without graphics)
+├── train_ai.py          ← Run this to train the AI
+├── export_ai_weights.py ← p2_ai.zip → p2_ai_weights.npz (run automatically after training)
 │
-├── p2_ai.zip          ← Created AFTER training — the AI's "brain"
-└── checkpoints/       ← Intermediate saves during training
+├── p2_ai.zip            ← Created AFTER training — the AI's "brain" (Stable-Baselines3 format)
+├── p2_ai_weights.npz    ← The same brain as plain numpy arrays — this is what the game loads
+└── checkpoints/         ← Intermediate saves during training
 ```
 
-**You only need to run two commands** — the rest is automatic.
+**Playing only needs pygame + numpy.** PyTorch / Stable-Baselines3 are only needed to train.
 
 ---
 
@@ -51,10 +54,10 @@ your-game-folder/
 Open a terminal in your game folder and run:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-train.txt
 ```
 
-This installs:
+This installs (on top of the game's own `requirements.txt`):
 - **stable-baselines3** — the RL library (contains PPO)
 - **gymnasium** — the standard interface for RL environments
 - **pygame** — already have it, but listed here just in case
@@ -91,19 +94,37 @@ You will see output like this:
 You can **press Ctrl+C** at any time — the latest checkpoint is saved and you
 can resume later or just use what you have.
 
-When finished, a file called `p2_ai.zip` will appear in your folder. That's
-the trained brain.
+When finished, `p2_ai.zip` (the trained brain) and `p2_ai_weights.npz` (the
+copy the game loads) will appear in your folder.
+
+> Stopped training early and only have a checkpoint? Export it yourself:
+> `python export_ai_weights.py checkpoints/p2_ai_1000000_steps.zip`
 
 ---
 
 ## Step 3 — Play Against the AI
 
 ```bash
-python game_with_ai.py
+python game.py                 # pick VS AI and a difficulty in the menu
+python game_with_ai.py         # or jump straight in (Medium)
+python game_with_ai.py --difficulty Hard
 ```
 
-Player 2 is now controlled by the AI. You play as Player 1 with WASD. The
-game is otherwise identical to your original.
+Player 2 is controlled by the AI. You play as Player 1 (WASD or arrows).
+
+The three difficulties all use the same network; they differ in reaction time,
+randomness and an extra "reflex" layer (see `DIFFICULTY_SETTINGS` in
+`ai_player.py`):
+
+| Level  | Decides every | Random actions | Action choice     | Reflexes |
+|--------|---------------|----------------|-------------------|----------|
+| Easy   | 12 frames     | 30 %           | sampled, temp 1.6 | basic, rarely |
+| Medium | 4 frames      | 6 %            | sampled           | basic, often |
+| Hard   | every frame   | 0 %            | best action       | full: dodges bullets, punishes whiffs, aims |
+
+All levels also follow a BFS path around obstacles when the way to the target
+is blocked: the training bots always walked *to* the AI, so it never had to
+learn navigation.
 
 ---
 
@@ -191,11 +212,11 @@ PPO adjusts the 8,000+ weights in this network to maximise cumulative reward.
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'stable_baselines3'`**
-→ Run `pip install stable-baselines3[extra]`
+**`ModuleNotFoundError: No module named 'stable_baselines3'`** (while training)
+→ Run `pip install -r requirements-train.txt`
 
-**`p2_ai.zip not found`**
-→ You need to run `train_ai.py` first to generate it.
+**Menu footer says "AI: Scripted bot (no p2_ai_weights.npz)"**
+→ The weights file is missing. Train (`train_ai.py`) or run `export_ai_weights.py`.
 
 **AI just stands still / walks into walls**
 → Not enough training. Increase TOTAL_TIMESTEPS and train again.
@@ -204,9 +225,11 @@ PPO adjusts the 8,000+ weights in this network to maximise cumulative reward.
 → Open `train_ai.py` and replace `SubprocVecEnv` with `DummyVecEnv`.
   It will be slower but works fine.
 
-**Game runs slowly during `game_with_ai.py`**
-→ The AI prediction is very fast (< 1ms). If the game is slow it's unrelated
-  to the AI — check your pygame display settings.
+**Game runs slowly**
+→ The AI prediction is very fast (< 1ms). The first launch spends a few
+  seconds generating map artwork (cached afterwards). On small screens the
+  game scales its 1920×1080 picture down; if frames stay slow it switches to a
+  cheaper scaler automatically. Fullscreen on a 1080p monitor needs no scaling.
 
 ---
 
@@ -214,6 +237,9 @@ PPO adjusts the 8,000+ weights in this network to maximise cumulative reward.
 
 | Command | What it does |
 |---------|-------------|
-| `python train_ai.py` | Train the AI (creates p2_ai.zip) |
-| `python game_with_ai.py` | Play against the trained AI |
-| `python game.py` | Original 2-human game (unchanged) |
+| `python train_ai.py` | Train the AI (creates p2_ai.zip + p2_ai_weights.npz) |
+| `python export_ai_weights.py [model.zip]` | Re-export weights from any saved model |
+| `python game.py` | The game — all modes |
+| `python game_with_ai.py` | Jump straight into a match vs the AI |
+| `python relay_server.py` | Optional relay for online play without port forwarding |
+| `python build_exe.py` | Build a stand-alone executable |

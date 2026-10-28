@@ -1,5 +1,3 @@
-pygame
-numpy
-gymnasium
-stable-baselines3[extra]
-torch
+# Everything needed to PLAY (all modes, including vs AI and online)
+pygame>=2.5
+numpy>=1.24

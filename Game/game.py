@@ -1,6 +1,22 @@
+import argparse
+import itertools
+import json
 import math
+import os
+import platform
 import random
-import pygame
+from collections import namedtuple
+
+import numpy as np
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+import pygame  # noqa: E402
+
+import map_art
+from ai_player import AIController, DIFFICULTIES, load_policy, policy_status
+from net import (BTN_DASH, BTN_MELEE, BTN_SHOOT, DEFAULT_PORT, PROTOCOL_VERSION,
+                 HostConnector, JoinConnector, LanBeacon, LanScanner)
+from sfx import SoundBank
 
 # ─────────────────────────────────────────────
 #  SETTINGS
@@ -9,6 +25,90 @@ WIDTH, HEIGHT = 1920, 1080
 FPS = 60
 MAX_WEAPON_PICKUPS = 5
 WEAPON_RESPAWN_INTERVAL = 300
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".arena_fighters.json")
+
+# ─────────────────────────────────────────────
+#  CACHED DRAWING HELPERS
+#  (sprites are built once instead of every frame)
+# ─────────────────────────────────────────────
+_sprite_cache = {}
+_font_cache = {}
+
+
+def get_font(size, bold=True):
+    key = (size, bold)
+    f = _font_cache.get(key)
+    if f is None:
+        f = pygame.font.SysFont("arialblack,arial,dejavusans", size) if bold \
+            else pygame.font.SysFont("segoeui,arial,dejavusans", size)
+        _font_cache[key] = f
+    return f
+
+
+def cached(key, builder):
+    spr = _sprite_cache.get(key)
+    if spr is None:
+        spr = _sprite_cache[key] = builder()
+    return spr
+
+
+def alpha_circle(color, r, alpha):
+    """Translucent filled circle; alpha is bucketed so the cache stays small."""
+    r = max(1, int(r))
+    alpha = max(0, min(255, int(alpha) // 16 * 16))
+
+    def build():
+        s = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+        pygame.draw.circle(s, (*color[:3], alpha), (r + 1, r + 1), r)
+        return s
+    return cached(("ac", tuple(color[:3]), r, alpha), build)
+
+
+def blit_center(surface, spr, x, y, flags=0):
+    surface.blit(spr, (int(x) - spr.get_width() // 2, int(y) - spr.get_height() // 2), special_flags=flags)
+
+
+def add_glow(surface, color, x, y, radius, intensity=1.0):
+    """Additive light blob – makes bullets, pickups and hits 'shine'."""
+    spr = map_art.glow_sprite(color, int(radius), round(intensity, 1))
+    blit_center(surface, spr, x, y, pygame.BLEND_ADD)
+
+
+def sphere_sprite(color, r, hit=False):
+    """A lit, anti-aliased ball used for the fighters' bodies."""
+    def build():
+        size = r * 2 + 4
+        yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+        c = (size - 1) / 2
+        nx, ny = (xx - c) / r, (yy - c) / r
+        d2 = nx * nx + ny * ny
+        nz = np.sqrt(np.clip(1 - d2, 0, 1))
+        lx, ly, lz = -0.45, -0.6, 0.66
+        diff = np.clip(nx * lx + ny * ly + nz * lz, 0, 1)
+        spec = diff ** 28
+        base = np.array((255, 110, 110) if hit else color, dtype=np.float32)
+        rgb = base[None, None, :] * (0.38 + 0.72 * diff)[..., None] + 255 * 0.6 * spec[..., None]
+        rim = np.clip((np.sqrt(d2) - 0.82) / 0.18, 0, 1)[..., None]
+        rgb = rgb * (1 - rim * 0.35)
+        alpha = np.clip((1 - np.sqrt(d2)) * r + 0.5, 0, 1) * 255
+        s = pygame.Surface((size, size), pygame.SRCALPHA)
+        px = pygame.surfarray.pixels3d(s)
+        px[:, :, :] = np.clip(rgb, 0, 255).astype(np.uint8).transpose(1, 0, 2)
+        del px
+        pa = pygame.surfarray.pixels_alpha(s)
+        pa[:, :] = alpha.astype(np.uint8).T
+        del pa
+        return s
+    return cached(("sphere", tuple(color), r, hit), build)
+
+
+def ground_shadow(w, h, alpha=110):
+    def build():
+        sh, _pad = map_art.soft_shadow((w, h), alpha, 4)
+        return sh
+    return cached(("gshadow", w, h, alpha), build)
 
 # ─────────────────────────────────────────────
 #  PIXEL-ART WEAPON SPRITES  (drawn procedurally)
@@ -136,8 +236,19 @@ WEAPON_TYPES = [
     Weapon("Plasma Gun",     (200, 100, 240), (210,  60, 255), True,  20, 22, 14, 12),
 ]
 
+WEAPON_NAMES = [w.name for w in WEAPON_TYPES]
+
+
+def weapon_index(weapon):
+    return WEAPON_NAMES.index(weapon.name) if weapon.name in WEAPON_NAMES else 0
+
+
+def weapon_from_index(idx):
+    return Weapon.default_weapon() if idx <= 0 else WEAPON_TYPES[idx]
+
+
 class Bullet:
-    def __init__(self, x, y, dx, dy, speed, damage, color, glow, owner):
+    def __init__(self, x, y, dx, dy, speed, damage, color, glow, owner, widx=0):
         self.x, self.y = x, y
         self.dx, self.dy = dx, dy
         self.speed = speed
@@ -145,6 +256,7 @@ class Bullet:
         self.color = color
         self.glow = glow
         self.owner = owner
+        self.widx = widx
         self.radius = 8
         self.trail = []
 
@@ -155,17 +267,17 @@ class Bullet:
         self.y += self.dy * self.speed
 
     def draw(self, surface):
+        n = len(self.trail)
         for i, (tx, ty) in enumerate(self.trail):
-            alpha = int(180 * (i / len(self.trail)))
-            r = max(2, self.radius - (len(self.trail) - i))
-            s = pygame.Surface((r * 2 + 4, r * 2 + 4), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*self.glow, alpha), (r + 2, r + 2), r)
-            surface.blit(s, (int(tx) - r - 2, int(ty) - r - 2))
-        glow_s = pygame.Surface((self.radius * 6, self.radius * 6), pygame.SRCALPHA)
-        pygame.draw.circle(glow_s, (*self.glow, 80), (self.radius * 3, self.radius * 3), self.radius * 3)
-        surface.blit(glow_s, (int(self.x) - self.radius * 3, int(self.y) - self.radius * 3))
+            r = max(2, self.radius - (n - i))
+            blit_center(surface, alpha_circle(self.glow, r, 180 * (i + 1) / n), tx, ty)
+        add_glow(surface, self.glow, self.x, self.y, self.radius * 4, 0.9)
         pygame.draw.circle(surface, self.color, (int(self.x), int(self.y)), self.radius)
-        pygame.draw.circle(surface, (255, 255, 255), (int(self.x), int(self.y)), self.radius, 2)
+        pygame.draw.circle(surface, (255, 255, 255), (int(self.x), int(self.y)), self.radius - 3)
+
+
+_pickup_ids = itertools.count(1)
+
 
 class WeaponPickup:
     def __init__(self, weapon, x, y):
@@ -174,34 +286,41 @@ class WeaponPickup:
         self.radius = 28
         self.bob = random.uniform(0, math.pi * 2)
         self.age = 0
+        self.id = next(_pickup_ids)
 
     def draw(self, surface):
         self.age += 1
         bob_y = math.sin(self.age * 0.05 + self.bob) * 6
         cx, cy = int(self.x), int(self.y + bob_y)
-        # outer glow rings
-        for r in range(38, 28, -2):
-            alpha = int(55 * (38 - r) / 10)
-            s = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*self.weapon.glow, alpha), (r, r), r)
-            surface.blit(s, (cx - r, cy - r))
-        # base circle
-        pygame.draw.circle(surface, (20, 20, 40), (cx, cy), self.radius)
-        pygame.draw.circle(surface, self.weapon.color, (cx, cy), self.radius, 3)
-        # weapon sprite centered
-        spr = self.weapon.get_sprite()
-        if spr:
-            spr_scaled = pygame.transform.scale(spr, (42, int(42 * spr.get_height() / spr.get_width())))
-            surface.blit(spr_scaled, spr_scaled.get_rect(center=(cx, cy)))
-        # name tag above
-        nfont = pygame.font.SysFont("arialblack", 16)
-        ntag = nfont.render(self.weapon.name, True, (240, 240, 240))
-        nr = ntag.get_rect(center=(cx, cy - self.radius - 14))
-        bg = pygame.Surface((nr.width + 12, nr.height + 6), pygame.SRCALPHA)
-        pygame.draw.rect(bg, (0, 0, 0, 160), (0, 0, nr.width + 12, nr.height + 6), border_radius=5)
-        pygame.draw.rect(bg, (*self.weapon.glow, 140), (0, 0, nr.width + 12, nr.height + 6), 1, border_radius=5)
-        surface.blit(bg, (nr.x - 6, nr.y - 3))
-        surface.blit(ntag, nr)
+        w = self.weapon
+        # shadow on the ground, shrinking as the item bobs up
+        sh = ground_shadow(44, 14, 90)
+        blit_center(surface, sh, self.x, self.y + self.radius + 4)
+        # pulsing light
+        pulse = 0.7 + 0.3 * math.sin(self.age * 0.08 + self.bob)
+        add_glow(surface, w.glow, cx, cy, 58, round(pulse * 0.8, 1))
+        # rotating ring
+        ang = self.age * 0.04
+        for k in range(3):
+            a0 = ang + k * math.tau / 3
+            pygame.draw.arc(surface, w.glow, (cx - 36, cy - 36, 72, 72), a0, a0 + 1.2, 3)
+        # base disc
+        pygame.draw.circle(surface, (16, 16, 34), (cx, cy), self.radius)
+        pygame.draw.circle(surface, w.color, (cx, cy), self.radius, 3)
+        spr = cached(("pickup_spr", w.name),
+                     lambda: pygame.transform.smoothscale(w.get_sprite(), (44, int(44 * w.get_sprite().get_height() / w.get_sprite().get_width()))))
+        blit_center(surface, spr, cx, cy)
+        tag = cached(("pickup_tag", w.name), lambda: self._make_tag(w))
+        blit_center(surface, tag, cx, cy - self.radius - 18)
+
+    @staticmethod
+    def _make_tag(w):
+        txt = get_font(15).render(w.name, True, (245, 245, 245))
+        bg = pygame.Surface((txt.get_width() + 14, txt.get_height() + 6), pygame.SRCALPHA)
+        pygame.draw.rect(bg, (0, 0, 0, 170), bg.get_rect(), border_radius=6)
+        pygame.draw.rect(bg, (*w.glow, 170), bg.get_rect(), 1, border_radius=6)
+        bg.blit(txt, (7, 3))
+        return bg
 
     def check_pickup(self, player):
         return math.hypot(player.x - self.x, player.y - self.y) <= player.radius + self.radius
@@ -245,6 +364,7 @@ class Player:
         self.ammo = -1
         self.shoot_cooldown_timer = 0
         self.trail = []
+        self.label = ""
 
     def move(self, dx, dy, sprint, arena):
         if self.dash_timer > 0:
@@ -315,7 +435,8 @@ class Player:
         by = self.y + self.facing_dy * (self.radius + 14)
         return Bullet(bx, by, self.facing_dx, self.facing_dy,
                       self.weapon.bullet_speed, self.weapon.damage,
-                      self.weapon.color, self.weapon.glow, self)
+                      self.weapon.color, self.weapon.glow, self,
+                      weapon_index(self.weapon))
 
     def pick_weapon(self, weapon):
         self.weapon = weapon
@@ -328,24 +449,24 @@ class Player:
         return math.hypot(self.x - x, self.y - y) <= self.radius + radius
 
     def draw(self, surface):
-        # dash trail
-        for i, (tx, ty) in enumerate(self.trail):
-            alpha = int(100 * i / max(len(self.trail), 1))
-            s = pygame.Surface((self.radius * 2, self.radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*self.glow_color, alpha), (self.radius, self.radius), self.radius)
-            surface.blit(s, (int(tx) - self.radius, int(ty) - self.radius))
-
+        x, y, r = int(self.x), int(self.y), self.radius
         hit = self.hit_timer > 0
         gc = (255, 80, 80) if hit else self.glow_color
-        for r in range(self.radius + 14, self.radius, -3):
-            a = int(50 * (r - self.radius) / 14)
-            s = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*gc, a), (r, r), r)
-            surface.blit(s, (int(self.x) - r, int(self.y) - r))
 
-        body_color = (255, 120, 120) if hit else self.color
-        pygame.draw.circle(surface, body_color, (int(self.x), int(self.y)), self.radius)
-        pygame.draw.circle(surface, (255, 255, 255), (int(self.x), int(self.y)), self.radius, 3)
+        # dash after-images
+        n = len(self.trail)
+        for i, (tx, ty) in enumerate(self.trail):
+            blit_center(surface, alpha_circle(self.glow_color, r, 120 * (i + 1) / max(n, 1)), tx, ty)
+
+        # ground shadow + team ring
+        blit_center(surface, ground_shadow(r * 2 + 10, r, 120), x + 5, y + r - 4)
+        ring = cached(("ring", self.glow_color), lambda: self._make_ring(self.glow_color))
+        blit_center(surface, ring, x, y + r - 6)
+
+        # aura + body
+        add_glow(surface, gc, x, y, r + 22, 0.55 if not hit else 0.9)
+        blit_center(surface, sphere_sprite(self.color, r, hit), x, y)
+        pygame.draw.circle(surface, (255, 255, 255), (x, y), r, 2)
 
         # weapon sprite attached to player, rotated toward facing
         # hide during sword swing (drawn separately in the swing block below)
@@ -358,57 +479,69 @@ class Player:
                 oy = self.y + self.facing_dy * (self.radius + 2)
                 surface.blit(rot, rot.get_rect(center=(int(ox), int(oy))))
 
-        # direction dot
-        fx = self.x + self.facing_dx * (self.radius - 8)
-        fy = self.y + self.facing_dy * (self.radius - 8)
+        # direction "eye"
+        fx = self.x + self.facing_dx * (self.radius - 9)
+        fy = self.y + self.facing_dy * (self.radius - 9)
+        pygame.draw.circle(surface, (20, 20, 30), (int(fx), int(fy)), 7)
         pygame.draw.circle(surface, (255, 255, 255), (int(fx), int(fy)), 5)
 
-        # melee weapon swing (only for sword / non-projectile weapons)
-        if self.is_attacking() and not self.weapon.projectile:
+        # melee weapon swing
+        if self.is_attacking():
             angle = math.atan2(self.facing_dy, self.facing_dx)
             progress = 1 - (self.attack_timer / self.attack_duration)
             # swing arc: starts at -70 deg, sweeps +140 deg through the hit
-            swing_offset = -1.22 + progress * 2.44   # radians (-70° to +70°)
+            swing_offset = -1.22 + progress * 2.44
             tip_angle = angle + swing_offset
+            col = self.weapon.glow if not self.weapon.projectile else (255, 255, 255)
 
-            # soft motion blur behind the blade, without turning the swing into a lightbar
-            for ti in range(5):
-                blur_progress = max(0.0, progress - ti * 0.08)
-                blur_angle = angle - 1.05 + blur_progress * 2.1
-                blur_dx = math.cos(blur_angle)
-                blur_dy = math.sin(blur_angle)
-                blur_x = int(self.x + blur_dx * (self.radius + 10 + ti * 3))
-                blur_y = int(self.y + blur_dy * (self.radius + 10 + ti * 3))
-                blur_s = pygame.Surface((34, 34), pygame.SRCALPHA)
-                pygame.draw.circle(blur_s, (*self.weapon.glow, 70 - ti * 10), (17, 17), 12 - ti)
-                surface.blit(blur_s, (blur_x - 17, blur_y - 17))
+            # crescent slash trail
+            for ti in range(7):
+                blur_progress = max(0.0, progress - ti * 0.06)
+                blur_angle = angle - 1.22 + blur_progress * 2.44
+                bx = self.x + math.cos(blur_angle) * (self.radius + 30)
+                by = self.y + math.sin(blur_angle) * (self.radius + 30)
+                blit_center(surface, alpha_circle(col, 13 - ti, 150 - ti * 20), bx, by)
+            add_glow(surface, col, self.x + math.cos(tip_angle) * (self.radius + 34),
+                     self.y + math.sin(tip_angle) * (self.radius + 34), 34, 0.6)
 
-            # draw the sword sprite rotated along the swing angle
-            spr = self.weapon.get_sprite()
-            if spr:
-                blade_angle_deg = -math.degrees(tip_angle)
-                big_spr = pygame.transform.scale(spr, (78, int(78 * spr.get_height() / spr.get_width())))
-                rot_spr = pygame.transform.rotate(big_spr, blade_angle_deg)
-                mid_x = int(self.x + math.cos(tip_angle) * (self.radius + 24))
-                mid_y = int(self.y + math.sin(tip_angle) * (self.radius + 24))
-                surface.blit(rot_spr, rot_spr.get_rect(center=(mid_x, mid_y)))
-
-            # small hilt flash at the hand to make the weapon read as a sword
-            hilt_x = int(self.x + math.cos(angle) * (self.radius - 3))
-            hilt_y = int(self.y + math.sin(angle) * (self.radius - 3))
-            pygame.draw.circle(surface, self.weapon.glow, (hilt_x, hilt_y), 4)
-            pygame.draw.circle(surface, (255, 255, 255), (hilt_x, hilt_y), 2)
+            if not self.weapon.projectile:
+                spr = self.weapon.get_sprite()
+                if spr:
+                    big_spr = cached(("bigsword", self.weapon.name),
+                                     lambda: pygame.transform.smoothscale(spr, (78, int(78 * spr.get_height() / spr.get_width()))))
+                    rot_spr = pygame.transform.rotate(big_spr, -math.degrees(tip_angle))
+                    mid_x = int(self.x + math.cos(tip_angle) * (self.radius + 24))
+                    mid_y = int(self.y + math.sin(tip_angle) * (self.radius + 24))
+                    surface.blit(rot_spr, rot_spr.get_rect(center=(mid_x, mid_y)))
 
         # health bar (directly above player)
         bw, bh = 64, 9
         bx = self.x - bw // 2
         by = self.y - self.radius - 18
-        pygame.draw.rect(surface, (20, 20, 20), (bx, by, bw, bh), border_radius=5)
+        pygame.draw.rect(surface, (20, 20, 20), (bx - 1, by - 1, bw + 2, bh + 2), border_radius=5)
         hp_frac = max(0, self.health / self.max_health)
-        hp_color = (int(40 + 200 * (1 - hp_frac)), int(180 * hp_frac), 40)
+        hp_color = (int(40 + 200 * (1 - hp_frac)), int(180 * hp_frac + 40), 50)
         if bw * hp_frac > 0:
             pygame.draw.rect(surface, hp_color, (bx, by, bw * hp_frac, bh), border_radius=5)
-        pygame.draw.rect(surface, (180, 180, 180), (bx, by, bw, bh), 1, border_radius=5)
+            pygame.draw.rect(surface, shade_color(hp_color, 60), (bx + 2, by + 1, max(0, bw * hp_frac - 4), 2), border_radius=2)
+        pygame.draw.rect(surface, (200, 200, 200), (bx, by, bw, bh), 1, border_radius=5)
+        if self.label:
+            tag = cached(("ptag", self.label, self.glow_color),
+                         lambda: get_font(14).render(self.label, True, self.glow_color))
+            outline = cached(("ptag_o", self.label), lambda: get_font(14).render(self.label, True, (0, 0, 0)))
+            surface.blit(outline, (int(self.x) - tag.get_width() // 2 + 1, int(by) - 20 + 1))
+            surface.blit(tag, (int(self.x) - tag.get_width() // 2, int(by) - 20))
+
+    @staticmethod
+    def _make_ring(color):
+        s = pygame.Surface((84, 30), pygame.SRCALPHA)
+        pygame.draw.ellipse(s, (*color, 70), (0, 0, 84, 30), 0)
+        pygame.draw.ellipse(s, (*color, 200), (0, 0, 84, 30), 2)
+        return s
+
+
+def shade_color(color, amount):
+    return tuple(max(0, min(255, c + amount)) for c in color[:3])
 
 # ─────────────────────────────────────────────
 #  OBSTACLES
@@ -425,19 +558,6 @@ class Obstacle:
     @classmethod
     def circle(cls, x, y, r, color=(90, 90, 110), edge=(140, 140, 160)):
         return cls("circle", x, y, r, None, color, edge)
-
-    def draw(self, surface):
-        if self.shape == "rect":
-            ss = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
-            ss.fill((0, 0, 0, 60))
-            surface.blit(ss, (self.x + 6, self.y + 6))
-            pygame.draw.rect(surface, self.color, (self.x, self.y, self.w, self.h), border_radius=10)
-            pygame.draw.rect(surface, self.edge, (self.x, self.y, self.w, self.h), 3, border_radius=10)
-        else:
-            cx, cy = int(self.x), int(self.y)
-            pygame.draw.circle(surface, (0, 0, 0, 60), (cx + 5, cy + 5), self.w)
-            pygame.draw.circle(surface, self.color, (cx, cy), self.w)
-            pygame.draw.circle(surface, self.edge, (cx, cy), self.w, 3)
 
     def collides_with_circle(self, px, py, pr):
         if self.shape == "rect":
@@ -466,122 +586,8 @@ class Obstacle:
         return px, py
 
 # ─────────────────────────────────────────────
-#  MAP DECORATIONS  (trees, rocks, crystals)
+#  MAP DECORATIONS  (positions; artwork lives in map_art.py)
 # ─────────────────────────────────────────────
-def draw_tree(surface, x, y, trunk_col=(80,55,30), leaf_col=(40,110,40), size=1.0):
-    """Draw a top-down tree: shadow, trunk, canopy layers."""
-    r = int(22 * size)
-    # shadow
-    sh = pygame.Surface((r*3, r*2), pygame.SRCALPHA)
-    pygame.draw.ellipse(sh, (0,0,0,55), (0, 0, r*3, r*2))
-    surface.blit(sh, (x - r + 8, y - r//2 + 10))
-    # trunk
-    pygame.draw.circle(surface, trunk_col, (x, y), int(7*size))
-    # outer canopy (darker)
-    dark = tuple(max(0, c-30) for c in leaf_col)
-    pygame.draw.circle(surface, dark, (x, y - int(4*size)), r+2)
-    # mid canopy
-    pygame.draw.circle(surface, leaf_col, (x, y - int(4*size)), r)
-    # highlight blob (top-left)
-    hi = tuple(min(255, c+45) for c in leaf_col)
-    pygame.draw.circle(surface, hi, (x - int(6*size), y - int(8*size)), int(r*0.5))
-    # small shadow blob (bottom-right)
-    pygame.draw.circle(surface, dark, (x + int(5*size), y + int(2*size)), int(r*0.45))
-
-def draw_rock(surface, x, y, color=(100,100,110), edge=(160,160,180), size=1.0):
-    """Draw a top-down rock: shadow + irregular polygon."""
-    pts_offsets = [(0,-1),(0.7,-0.6),(1,-0.1),(0.65,0.7),(0,1),(-0.65,0.65),(-1,0.05),(-0.6,-0.7)]
-    r = int(18 * size)
-    sh_pts = [(x + int(dx*r)+7, y + int(dy*r)+8) for dx,dy in pts_offsets]
-    sh = pygame.Surface((r*4, r*4), pygame.SRCALPHA)
-    adjusted = [(px - (x-r*2), py - (y-r*2)) for px,py in sh_pts]
-    if len(adjusted) >= 3:
-        pygame.draw.polygon(sh, (0,0,0,60), adjusted)
-    surface.blit(sh, (x-r*2, y-r*2))
-    pts = [(x + int(dx*r), y + int(dy*r)) for dx,dy in pts_offsets]
-    if len(pts) >= 3:
-        pygame.draw.polygon(surface, color, pts)
-        pygame.draw.polygon(surface, edge, pts, 2)
-    # highlight
-    hi = tuple(min(255,c+50) for c in color)
-    hl = [(x + int(dx*r*0.55) - int(r*0.2), y + int(dy*r*0.55) - int(r*0.25))
-          for dx,dy in pts_offsets[:4]]
-    if len(hl) >= 3:
-        pygame.draw.polygon(surface, hi, hl)
-
-def draw_neon_crystal(surface, x, y, color=(0,220,200), size=1.0, tick=0):
-    r = int(14 * size)
-    pulse = 0.85 + 0.15 * math.sin(tick * 0.06 + x * 0.01)
-    pr = int(r * pulse)
-    glow_s = pygame.Surface((pr*6, pr*6), pygame.SRCALPHA)
-    pygame.draw.circle(glow_s, (*color, 50), (pr*3, pr*3), pr*3)
-    surface.blit(glow_s, (x - pr*3, y - pr*3))
-    pts = [(x, y-pr*2),(x+pr,y),(x,y+pr),(x-pr,y)]
-    pygame.draw.polygon(surface, color, pts)
-    hi = tuple(min(255,c+80) for c in color)
-    pygame.draw.polygon(surface, hi, pts, 2)
-
-def draw_ruins_column(surface, x, y, color=(75,75,120), edge=(130,120,200), size=1.0):
-    w = int(16*size); h = int(36*size)
-    # shadow
-    pygame.draw.ellipse(surface, (0,0,0,50), (x-w+5, y+h//2+4, w*2, h//3))
-    # shaft
-    pygame.draw.rect(surface, color, (x-w//2, y-h//2, w, h), border_radius=3)
-    pygame.draw.rect(surface, edge, (x-w//2, y-h//2, w, h), 2, border_radius=3)
-    # capital at top
-    cap_w = int(w*1.6)
-    pygame.draw.rect(surface, tuple(min(255,c+20) for c in color),
-                     (x-cap_w//2, y-h//2-6, cap_w, 8), border_radius=2)
-    pygame.draw.rect(surface, edge, (x-cap_w//2, y-h//2-6, cap_w, 8), 1, border_radius=2)
-
-def draw_dead_tree(surface, x, y, color=(60,40,25), size=1.0):
-    """Bare/dead tree for quarry / dark maps."""
-    r = int(5*size)
-    # trunk
-    pygame.draw.line(surface, color, (x, y+int(20*size)), (x, y-int(14*size)), int(5*size))
-    # branches
-    blen = int(14*size)
-    for ang in [-0.9, -0.5, 0.5, 0.9]:
-        bx = x + int(math.cos(ang - math.pi/2) * blen)
-        by = (y - int(8*size)) + int(math.sin(ang - math.pi/2) * blen)
-        pygame.draw.line(surface, color, (x, y - int(8*size)), (bx, by), int(3*size))
-    pygame.draw.circle(surface, (0,0,0,40), (x+4, y+int(18*size)), int(9*size))
-
-def draw_bush(surface, x, y, color=(55,130,60), size=1.0):
-    r = int(12 * size)
-    shadow = pygame.Surface((r * 4, r * 3), pygame.SRCALPHA)
-    pygame.draw.ellipse(shadow, (0, 0, 0, 45), (0, 0, r * 4, r * 2))
-    surface.blit(shadow, (x - r * 2 + 5, y - r + 8))
-    for ox, oy, scale in [(-8, 0, 0.9), (0, -4, 1.1), (9, 1, 0.95)]:
-        rr = int(r * scale)
-        pygame.draw.circle(surface, color, (x + ox, y + oy), rr)
-    hi = tuple(min(255, c + 35) for c in color)
-    pygame.draw.circle(surface, hi, (x - 4, y - 6), int(r * 0.55))
-
-def draw_stump(surface, x, y, color=(95, 70, 45), edge=(140, 105, 70), size=1.0):
-    w = int(18 * size)
-    h = int(14 * size)
-    pygame.draw.ellipse(surface, (0, 0, 0, 50), (x - w, y + h // 2 + 4, w * 2, h))
-    pygame.draw.rect(surface, color, (x - w // 2, y - h // 2, w, h), border_radius=4)
-    pygame.draw.rect(surface, edge, (x - w // 2, y - h // 2, w, h), 2, border_radius=4)
-    pygame.draw.circle(surface, tuple(min(255, c + 20) for c in color), (x - w // 6, y - h // 6), max(2, int(4 * size)))
-
-def draw_ruin_debris(surface, x, y, color=(100, 95, 150), edge=(170, 160, 220), size=1.0):
-    r = int(14 * size)
-    pts = [(x - r, y + 2), (x - r // 2, y - r), (x + r // 3, y - r // 2), (x + r, y + r // 3), (x, y + r)]
-    pygame.draw.polygon(surface, (0, 0, 0, 50), [(px + 4, py + 5) for px, py in pts])
-    pygame.draw.polygon(surface, color, pts)
-    pygame.draw.polygon(surface, edge, pts, 2)
-
-def draw_crate(surface, x, y, color=(120, 90, 55), edge=(180, 135, 80), size=1.0):
-    w = int(22 * size)
-    h = int(18 * size)
-    pygame.draw.ellipse(surface, (0, 0, 0, 50), (x - w // 2, y + h // 2 + 5, w, h // 2))
-    pygame.draw.rect(surface, color, (x - w // 2, y - h // 2, w, h), border_radius=3)
-    pygame.draw.rect(surface, edge, (x - w // 2, y - h // 2, w, h), 2, border_radius=3)
-    pygame.draw.line(surface, edge, (x - w // 2 + 3, y - h // 2 + 3), (x + w // 2 - 3, y + h // 2 - 3), 2)
-    pygame.draw.line(surface, edge, (x - w // 2 + 3, y + h // 2 - 3), (x + w // 2 - 3, y - h // 2 + 3), 2)
-
 # Build decoration layouts per map (pre-computed positions)
 def _forest_decor():
     """Trees and rocks for Forest Canyon."""
@@ -667,82 +673,39 @@ MAP_DECOR = [_forest_decor(), _quarry_decor(), _ruins_decor(), _neon_decor()]
 
 
 class Map:
-    def __init__(self, name, top_color, bottom_color, accent, player_starts, obstacles, decor=None):
+    def __init__(self, name, top_color, bottom_color, accent, player_starts, obstacles, decor=None, style="forest"):
         self.name = name; self.top_color = top_color; self.bottom_color = bottom_color
         self.accent = accent; self.player_starts = player_starts; self.obstacles = obstacles
         self.decor = decor or []
-        self._bg = None
-        self._decor_surf = None
+        self.style = style
+        self._layer = None
+        self._animator = None
+        self._thumb = None
 
-    def _build_bg(self):
-        bg = pygame.Surface((WIDTH, HEIGHT))
-        for y in range(HEIGHT):
-            t = y / HEIGHT
-            c = tuple(int(self.top_color[i] * (1 - t) + self.bottom_color[i] * t) for i in range(3))
-            pygame.draw.line(bg, c, (0, y), (WIDTH, y))
-        # subtle ground texture dots
-        rng = random.Random(42)
-        for _ in range(600):
-            gx = rng.randint(0, WIDTH-1); gy = rng.randint(0, HEIGHT-1)
-            t = gy / HEIGHT
-            base = tuple(int(self.top_color[i] * (1 - t) + self.bottom_color[i] * t) for i in range(3))
-            shade = tuple(max(0, min(255, c + rng.randint(-18, 18))) for c in base)
-            pygame.draw.circle(bg, shade, (gx, gy), rng.randint(2, 5))
-        return bg
+    # artwork is built lazily: the headless training environment never draws
+    def static_layer(self):
+        if self._layer is None:
+            self._layer = map_art.cached_static_layer(self, self.style)
+        return self._layer
 
-    def _build_decor_surf(self):
-        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        for item in self.decor:
-            kind = item[0]
-            if kind == 'tree':
-                _, x, y, sz = item
-                draw_tree(s, x, y,
-                          trunk_col=(70,48,24),
-                          leaf_col=(38,115,45), size=sz)
-            elif kind == 'rock_forest':
-                _, x, y, sz = item
-                draw_rock(s, x, y, (85,92,80), (130,145,110), sz)
-            elif kind == 'dead_tree':
-                _, x, y, sz = item
-                draw_dead_tree(s, x, y, (70,48,28), sz)
-            elif kind == 'rock_quarry':
-                _, x, y, sz = item
-                draw_rock(s, x, y, (120,95,65), (185,145,90), sz)
-            elif kind == 'column':
-                _, x, y, sz = item
-                draw_ruins_column(s, x, y, (75,75,120), (130,120,200), sz)
-            elif kind == 'rock_ruins':
-                _, x, y, sz = item
-                draw_rock(s, x, y, (80,78,130), (140,130,210), sz)
-            elif kind == 'bush_forest':
-                _, x, y, sz = item
-                draw_bush(s, x, y, (45,125,55), sz)
-            elif kind == 'bush_quarry':
-                _, x, y, sz = item
-                draw_bush(s, x, y, (90,95,60), sz)
-            elif kind == 'stump':
-                _, x, y, sz = item
-                draw_stump(s, x, y, (100, 75, 45), (150, 115, 70), sz)
-            elif kind == 'ruin_debris':
-                _, x, y, sz = item
-                draw_ruin_debris(s, x, y, (98, 96, 156), (170, 164, 230), sz)
-            elif kind == 'crate_neon':
-                _, x, y, sz = item
-                draw_crate(s, x, y, (55, 55, 80), (0, 220, 180), sz)
-            # crystals drawn live (animated), skip here
-        return s
+    def thumbnail(self, size):
+        if self._thumb is None or self._thumb.get_size() != size:
+            self._thumb = pygame.transform.smoothscale(self.static_layer(), size)
+        return self._thumb
+
+    def animator(self):
+        if self._animator is None:
+            self._animator = map_art.MapAnimator(self, self.style)
+        return self._animator
 
     def draw(self, surface, tick=0):
-        if self._bg is None: self._bg = self._build_bg()
-        if self._decor_surf is None: self._decor_surf = self._build_decor_surf()
-        surface.blit(self._bg, (0, 0))
-        surface.blit(self._decor_surf, (0, 0))
-        # draw animated neon crystals live
-        for item in self.decor:
-            if item[0] == 'crystal':
-                _, x, y, col = item
-                draw_neon_crystal(surface, x, y, col, size=1.0, tick=tick)
-        for ob in self.obstacles: ob.draw(surface)
+        surface.blit(self.static_layer(), (0, 0))
+        anim = self.animator()
+        anim.update()
+        anim.draw_under(surface, tick)
+
+    def draw_overlay(self, surface, tick=0):
+        self.animator().draw_over(surface, tick)
 
     def is_within_bounds(self, x, y, r):
         return r <= x <= WIDTH - r and r <= y <= HEIGHT - r
@@ -769,7 +732,7 @@ def create_maps():
              Obstacle.rect(200,170,200,44,(80,85,70),(120,130,95)),
              Obstacle.rect(1620,730,190,44,(80,85,70),(120,130,95)),
              Obstacle.rect(400,820,260,40,(70,75,65),(110,120,90)),
-             Obstacle.rect(1200,180,240,40,(70,75,65),(110,120,90))], d[0]),
+             Obstacle.rect(1200,180,240,40,(70,75,65),(110,120,90))], d[0], "forest"),
         Map("Sunset Quarry", (80,32,12),(190,100,22),(255,150,60),
             [(240,240),(1680,840)],
             [Obstacle.rect(580,130,760,64,(110,80,55),(180,130,80)),
@@ -780,7 +743,7 @@ def create_maps():
              Obstacle.rect(500,750,200,50,(110,80,55),(180,130,80)),
              Obstacle.rect(1220,760,210,50,(110,80,55),(180,130,80)),
              Obstacle.circle(340,620,36,(120,95,65),(190,145,90)),
-             Obstacle.circle(1580,400,36,(120,95,65),(190,145,90))], d[1]),
+             Obstacle.circle(1580,400,36,(120,95,65),(190,145,90))], d[1], "quarry"),
         Map("Ruins Arena", (14,18,50),(65,50,110),(160,120,255),
             [(340,540),(1580,540)],
             [Obstacle.rect(460,200,68,340,(75,75,120),(130,120,200)),
@@ -792,7 +755,7 @@ def create_maps():
              Obstacle.rect(260,700,160,44,(75,75,120),(130,120,200)),
              Obstacle.rect(1500,700,160,44,(75,75,120),(130,120,200)),
              Obstacle.circle(540,560,34,(85,80,135),(140,130,210)),
-             Obstacle.circle(1380,560,34,(85,80,135),(140,130,210))], d[2]),
+             Obstacle.circle(1380,560,34,(85,80,135),(140,130,210))], d[2], "ruins"),
         Map("Neon Void", (5,5,20),(10,8,40),(0,255,200),
             [(280,540),(1640,540)],
             [Obstacle.rect(600,200,160,160,(20,20,60),(0,220,180)),
@@ -804,7 +767,7 @@ def create_maps():
              Obstacle.circle(400,350,40,(20,20,60),(255,60,200)),
              Obstacle.circle(1520,350,40,(20,20,60),(255,60,200)),
              Obstacle.circle(400,730,40,(20,20,60),(60,255,200)),
-             Obstacle.circle(1520,730,40,(20,20,60),(60,255,200))], d[3]),
+             Obstacle.circle(1520,730,40,(20,20,60),(60,255,200))], d[3], "neon"),
     ]
 
 MAP_NAMES = ["Forest Canyon", "Sunset Quarry", "Ruins Arena", "Neon Void"]
@@ -815,13 +778,23 @@ MAP_DESCRIPTIONS = [
     "Cyberpunk void with glowing geometric obstacles.",
 ]
 
+_shared_maps = None
+
+
+def shared_maps():
+    """Maps are static data + lazily built art, so every Arena can share them."""
+    global _shared_maps
+    if _shared_maps is None:
+        _shared_maps = create_maps()
+    return _shared_maps
+
 # ─────────────────────────────────────────────
 #  ARENA
 # ─────────────────────────────────────────────
 class Arena:
     def __init__(self, player1, player2, map_index=0):
         self.player1 = player1; self.player2 = player2
-        self.all_maps = create_maps(); self.map_index = map_index
+        self.all_maps = shared_maps(); self.map_index = map_index
         self.map = self.all_maps[map_index]; self.weapon_pickups = []
         self.spawn_timer = WEAPON_RESPAWN_INTERVAL // 2
         self._place_players()
@@ -867,6 +840,8 @@ def resolve_player_collision(p1, p2):
         px, py = dx / dist * overlap, dy / dist * overlap
         p1.x -= px; p1.y -= py; p2.x += px; p2.y += py
 
+
+
 # ─────────────────────────────────────────────
 #  HUD & UI HELPERS
 # ─────────────────────────────────────────────
@@ -875,461 +850,1519 @@ def draw_text_shadow(surface, text, font, color, pos, shadow=(2, 2)):
     surface.blit(s, (pos[0] + shadow[0], pos[1] + shadow[1]))
     surface.blit(font.render(text, True, color), pos)
 
+
+def draw_text_center(surface, text, font, color, center, shadow=2):
+    img = font.render(text, True, color)
+    r = img.get_rect(center=center)
+    if shadow:
+        surface.blit(font.render(text, True, (0, 0, 0)), (r.x + shadow, r.y + shadow))
+    surface.blit(img, r)
+    return r
+
+
 def draw_panel(surface, rect, bg=(20, 20, 40), alpha=200, radius=16, border=(100, 100, 160)):
-    s = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
-    shadow = pygame.Surface((rect.width + 18, rect.height + 18), pygame.SRCALPHA)
-    pygame.draw.rect(shadow, (0, 0, 0, 70), (8, 8, rect.width, rect.height), border_radius=radius + 2)
-    surface.blit(shadow, (rect.x - 8, rect.y - 8))
-    pygame.draw.rect(s, (*bg, alpha), (0, 0, rect.width, rect.height), border_radius=radius)
-    pygame.draw.rect(s, (*border, 190), (0, 0, rect.width, rect.height), 2, border_radius=radius)
-    surface.blit(s, rect.topleft)
+    def build():
+        s = pygame.Surface((rect.width + 18, rect.height + 18), pygame.SRCALPHA)
+        pygame.draw.rect(s, (0, 0, 0, 70), (12, 14, rect.width, rect.height), border_radius=radius + 2)
+        pygame.draw.rect(s, (*bg, alpha), (4, 4, rect.width, rect.height), border_radius=radius)
+        hi = pygame.Surface((rect.width, rect.height // 2), pygame.SRCALPHA)
+        pygame.draw.rect(hi, (255, 255, 255, 14), hi.get_rect(), border_top_left_radius=radius, border_top_right_radius=radius)
+        s.blit(hi, (4, 4))
+        pygame.draw.rect(s, (*border, 190), (4, 4, rect.width, rect.height), 2, border_radius=radius)
+        return s
+    surface.blit(cached(("panel", rect.size, bg, alpha, radius, border), build), (rect.x - 4, rect.y - 4))
+
 
 def draw_hud_bar(surface, x, y, w, h, frac, fill_color, bg=(20,20,20), border=(160,160,160), radius=5):
     pygame.draw.rect(surface, bg, (x, y, w, h), border_radius=radius)
     if frac > 0:
         fw = max(radius * 2, int(w * frac))
         pygame.draw.rect(surface, fill_color, (x, y, fw, h), border_radius=radius)
+        pygame.draw.rect(surface, shade_color(fill_color, 55), (x + 3, y + 2, max(0, fw - 6), max(1, h // 4)), border_radius=radius)
     pygame.draw.rect(surface, border, (x, y, w, h), 1, border_radius=radius)
+
 
 class Button:
     def __init__(self, text, x, y, w, h, base=(30,30,55), accent=(140,120,255)):
         self.text = text; self.rect = pygame.Rect(x, y, w, h)
         self.base = base; self.accent = accent
 
-    def draw(self, surface, font, override_accent=None):
+    def hovered(self):
+        return self.rect.collidepoint(mouse_pos())
+
+    def draw(self, surface, font, override_accent=None, selected=False):
         ac = override_accent or self.accent
-        hovered = self.rect.collidepoint(pygame.mouse.get_pos())
-        col = tuple(min(255, c + 28) for c in self.base) if hovered else self.base
+        hovered = self.hovered()
+        col = tuple(min(255, c + 28) for c in self.base) if (hovered or selected) else self.base
         shadow = self.rect.inflate(12, 12)
         gs = pygame.Surface((shadow.width, shadow.height), pygame.SRCALPHA)
         pygame.draw.rect(gs, (0, 0, 0, 70), (4, 6, shadow.width - 8, shadow.height - 8), border_radius=22)
         surface.blit(gs, shadow.topleft)
-        if hovered:
+        if hovered or selected:
             glow = self.rect.inflate(14, 14)
             gs = pygame.Surface((glow.width, glow.height), pygame.SRCALPHA)
-            pygame.draw.rect(gs, (*ac, 80), (0, 0, glow.width, glow.height), border_radius=22)
+            pygame.draw.rect(gs, (*ac, 110 if selected else 70), (0, 0, glow.width, glow.height), border_radius=22)
             surface.blit(gs, glow.topleft)
         pygame.draw.rect(surface, col, self.rect, border_radius=22)
-        pygame.draw.rect(surface, ac, self.rect, 2, border_radius=22)
+        hi = pygame.Rect(self.rect.x + 6, self.rect.y + 4, self.rect.width - 12, self.rect.height // 2 - 4)
+        hs = pygame.Surface(hi.size, pygame.SRCALPHA)
+        pygame.draw.rect(hs, (255, 255, 255, 18), hs.get_rect(), border_radius=16)
+        surface.blit(hs, hi.topleft)
+        pygame.draw.rect(surface, ac, self.rect, 3 if selected else 2, border_radius=22)
         label = font.render(self.text, True, (245, 245, 255))
         surface.blit(label, label.get_rect(center=self.rect.center))
 
     def clicked(self, event):
         return event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.rect.collidepoint(event.pos)
 
+
+class TextField:
+    def __init__(self, label, x, y, w, h, text="", placeholder="", max_len=60):
+        self.label = label; self.rect = pygame.Rect(x, y, w, h)
+        self.text = text; self.placeholder = placeholder
+        self.max_len = max_len; self.focused = False
+
+    def handle(self, event):
+        """Returns True when Enter is pressed inside the field."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.focused = self.rect.collidepoint(event.pos)
+        elif self.focused and event.type == pygame.TEXTINPUT:
+            self.text = (self.text + event.text)[:self.max_len]
+        elif self.focused and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_BACKSPACE:
+                self.text = self.text[:-1]
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                return True
+            elif event.key == pygame.K_v and event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META):
+                try:
+                    pasted = pygame.scrap.get_text() if hasattr(pygame.scrap, "get_text") else ""
+                    self.text = (self.text + (pasted or "").strip())[:self.max_len]
+                except Exception:
+                    pass
+        return False
+
+    def draw(self, surface, tick):
+        draw_text_shadow(surface, self.label, get_font(18), (180, 180, 220), (self.rect.x + 4, self.rect.y - 28))
+        pygame.draw.rect(surface, (12, 12, 28), self.rect, border_radius=12)
+        pygame.draw.rect(surface, (150, 130, 255) if self.focused else (80, 80, 120), self.rect, 2, border_radius=12)
+        font = get_font(26, bold=False)
+        if self.text:
+            img = font.render(self.text, True, (240, 240, 255))
+        else:
+            img = font.render(self.placeholder, True, (110, 110, 140))
+        surface.blit(img, (self.rect.x + 16, self.rect.centery - img.get_height() // 2))
+        if self.focused and (tick // 30) % 2 == 0:
+            cx = self.rect.x + 18 + (img.get_width() if self.text else 0)
+            pygame.draw.line(surface, (220, 220, 255), (cx, self.rect.y + 12), (cx, self.rect.bottom - 12), 2)
+
+
+def banner_text(text, size, color, glow=None):
+    """Big outlined + glowing title text (cached)."""
+    def build():
+        font = get_font(size)
+        main = font.render(text, True, color)
+        w, h = main.get_width() + 40, main.get_height() + 40
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        dark = font.render(text, True, (10, 10, 20))
+        for dx, dy in ((-4, 0), (4, 0), (0, -4), (0, 4), (-3, -3), (3, 3), (-3, 3), (3, -3), (5, 6)):
+            s.blit(dark, (20 + dx, 20 + dy))
+        if glow:
+            g = pygame.Surface((w, h), pygame.SRCALPHA)
+            g.blit(font.render(text, True, glow), (20, 20))
+            g = map_art.blur_surface(g, 6)
+            for _ in range(2):
+                s.blit(g, (0, 0))
+        s.blit(main, (20, 20))
+        return s
+    return cached(("banner", text, size, color, glow), build)
+
+
 # ─────────────────────────────────────────────
-#  PARTICLES
+#  PARTICLES & EFFECTS
 # ─────────────────────────────────────────────
 class Particle:
-    def __init__(self, x, y, color):
+    def __init__(self, x, y, color, speed=(2, 7), life=(15, 35), size=(3, 7), gravity=0.2):
         self.x, self.y = x, y; self.color = color
-        angle = random.uniform(0, math.pi * 2); speed = random.uniform(2, 7)
-        self.vx = math.cos(angle) * speed; self.vy = math.sin(angle) * speed
-        self.life = random.randint(15, 35); self.max_life = self.life
-        self.r = random.randint(3, 7)
+        angle = random.uniform(0, math.pi * 2); spd = random.uniform(*speed)
+        self.vx = math.cos(angle) * spd; self.vy = math.sin(angle) * spd
+        self.life = random.randint(*life); self.max_life = self.life
+        self.r = random.randint(*size)
+        self.gravity = gravity
 
     def update(self):
         self.x += self.vx; self.y += self.vy
-        self.vy += 0.2; self.vx *= 0.95; self.vy *= 0.95; self.life -= 1
+        self.vy += self.gravity; self.vx *= 0.95; self.vy *= 0.95; self.life -= 1
 
     def draw(self, surface):
-        a = int(255 * self.life / self.max_life)
-        s = pygame.Surface((self.r * 2, self.r * 2), pygame.SRCALPHA)
-        pygame.draw.circle(s, (*self.color, a), (self.r, self.r), self.r)
-        surface.blit(s, (int(self.x) - self.r, int(self.y) - self.r))
+        f = self.life / self.max_life
+        blit_center(surface, alpha_circle(self.color, max(1, self.r * (0.4 + 0.6 * f)), 255 * f), self.x, self.y)
+
+
+class FloatingText:
+    def __init__(self, text, x, y, color, size=26, life=55):
+        self.text, self.x, self.y, self.color, self.size = text, x, y, color, size
+        self.life = self.max_life = life
+        self.vx = random.uniform(-0.6, 0.6)
+
+    def update(self):
+        self.y -= 1.3 * (self.life / self.max_life) + 0.2
+        self.x += self.vx
+        self.life -= 1
+
+    def draw(self, surface):
+        img = banner_text(self.text, self.size, self.color)
+        a = int(255 * min(1.0, self.life / (self.max_life * 0.4)))
+        img.set_alpha(a)
+        blit_center(surface, img, self.x, self.y)
+        img.set_alpha(255)
+
+
+class Shockwave:
+    def __init__(self, x, y, color, max_r=90, life=18, width=6):
+        self.x, self.y, self.color = x, y, color
+        self.max_r, self.life, self.max_life, self.width = max_r, life, life, width
+
+    def update(self):
+        self.life -= 1
+
+    def draw(self, surface):
+        t = 1 - self.life / self.max_life
+        r = int(10 + (self.max_r - 10) * (1 - (1 - t) ** 2))
+        w = max(1, int(self.width * (1 - t)))
+        pygame.draw.circle(surface, self.color, (int(self.x), int(self.y)), r, w)
+
 
 # ─────────────────────────────────────────────
-#  DRAW IN-GAME HUD  (no overlap version)
+#  INPUT
 # ─────────────────────────────────────────────
-def draw_game_hud(screen, p1, p2, arena, tick, BODY_FONT, SMALL_FONT, TINY_FONT):
-    PAD = 18
-    PW = 320   # panel width
-    PH = 160   # panel height
+PlayerInput = namedtuple("PlayerInput", "dx dy sprint dash melee shoot")
+NO_INPUT = PlayerInput(0, 0, False, False, False, False)
 
-    # ── P1 panel — top-left ──
-    p1r = pygame.Rect(PAD, PAD, PW, PH)
-    draw_panel(screen, p1r, (8, 16, 30), 210, 14, (80, 140, 200))
-    # player color dot
-    pygame.draw.circle(screen, p1.color, (p1r.x + 22, p1r.y + 24), 10)
-    pygame.draw.circle(screen, p1.glow_color, (p1r.x + 22, p1r.y + 24), 10, 2)
-    draw_text_shadow(screen, "PLAYER 1", BODY_FONT, (120, 200, 255), (p1r.x + 38, p1r.y + 14))
-    # HP label + bar
-    draw_text_shadow(screen, "HP", TINY_FONT, (160, 220, 160), (p1r.x + PAD, p1r.y + 50))
-    hp1 = max(0, p1.health / p1.max_health)
-    hp1_col = (int(40 + 200 * (1 - hp1)), int(180 * hp1), 40)
-    draw_hud_bar(screen, p1r.x + 48, p1r.y + 52, PW - 66, 14, hp1, hp1_col, border=(80,140,80))
-    hp_txt = TINY_FONT.render(f"{int(p1.health)}/{p1.max_health}", True, (200,240,200))
-    hp_txt_x = p1r.x + 48 + (PW - 66) - hp_txt.get_width() - 8
-    screen.blit(hp_txt, (hp_txt_x, p1r.y + 50))
-    # Stamina bar
-    draw_text_shadow(screen, "SP", TINY_FONT, (100, 180, 230), (p1r.x + PAD, p1r.y + 76))
-    draw_hud_bar(screen, p1r.x + 48, p1r.y + 78, PW - 66, 10, p1.stamina / p1.max_stamina,
-                 (60, 180, 230), border=(60,130,180))
-    # Weapon icon + name + ammo
-    spr = p1.weapon.get_sprite()
-    wy = p1r.y + 102
-    if spr:
-        spr_s = pygame.transform.scale(spr, (40, int(40 * spr.get_height() / spr.get_width())))
-        screen.blit(spr_s, (p1r.x + PAD, wy))
-    draw_text_shadow(screen, p1.weapon.name, SMALL_FONT, p1.weapon.color, (p1r.x + 62, wy + 2))
-    if p1.weapon.projectile:
-        ammo_col = (255, 200, 80) if p1.display_ammo() != "∞" and p1.ammo <= 3 else (200, 200, 200)
-        draw_text_shadow(screen, f"Ammo: {p1.display_ammo()}", SMALL_FONT, ammo_col, (p1r.x + 62, wy + 24))
+SCHEME_P1 = dict(left=[pygame.K_a], right=[pygame.K_d], up=[pygame.K_w], down=[pygame.K_s],
+                 sprint=[pygame.K_LSHIFT], dash=[pygame.K_q], melee=[pygame.K_f], shoot=[pygame.K_e])
+SCHEME_P2 = dict(left=[pygame.K_LEFT], right=[pygame.K_RIGHT], up=[pygame.K_UP], down=[pygame.K_DOWN],
+                 sprint=[pygame.K_RSHIFT], dash=[pygame.K_SLASH, pygame.K_QUESTION],
+                 melee=[pygame.K_RCTRL], shoot=[pygame.K_PERIOD])
+# one human on the keyboard (vs AI / online): both layouts work, plus Space and the mouse
+SCHEME_SOLO = {k: SCHEME_P1[k] + SCHEME_P2[k] for k in SCHEME_P1}
+SCHEME_SOLO["dash"] = SCHEME_SOLO["dash"] + [pygame.K_SPACE]
+SCHEME_SOLO["melee"] = SCHEME_SOLO["melee"] + [pygame.K_j]
+SCHEME_SOLO["shoot"] = SCHEME_SOLO["shoot"] + [pygame.K_k]
 
-    # ── P2 panel — top-right ──
-    p2r = pygame.Rect(WIDTH - PAD - PW, PAD, PW, PH)
-    draw_panel(screen, p2r, (30, 14, 8), 210, 14, (200, 130, 80))
-    pygame.draw.circle(screen, p2.color, (p2r.x + PW - 22, p2r.y + 24), 10)
-    pygame.draw.circle(screen, p2.glow_color, (p2r.x + PW - 22, p2r.y + 24), 10, 2)
-    p2_label = BODY_FONT.render("PLAYER 2", True, (255, 170, 100))
-    screen.blit(p2_label, (p2r.x + PW - 38 - p2_label.get_width(), p2r.y + 14))
-    # HP
-    draw_text_shadow(screen, "HP", TINY_FONT, (220, 160, 100), (p2r.x + PAD, p2r.y + 50))
-    hp2 = max(0, p2.health / p2.max_health)
-    hp2_col = (int(40 + 200 * (1 - hp2)), int(180 * hp2), 40)
-    draw_hud_bar(screen, p2r.x + 48, p2r.y + 52, PW - 66, 14, hp2, hp2_col, border=(140,80,40))
-    hp_txt2 = TINY_FONT.render(f"{int(p2.health)}/{p2.max_health}", True, (240,210,180))
-    hp_txt2_x = p2r.x + 48 + (PW - 66) - hp_txt2.get_width() - 8
-    screen.blit(hp_txt2, (hp_txt2_x, p2r.y + 50))
-    # Stamina
-    draw_text_shadow(screen, "SP", TINY_FONT, (200, 140, 80), (p2r.x + PAD, p2r.y + 76))
-    draw_hud_bar(screen, p2r.x + 48, p2r.y + 78, PW - 66, 10, p2.stamina / p2.max_stamina,
-                 (230, 140, 60), border=(180,110,50))
-    # Weapon
-    spr2 = p2.weapon.get_sprite()
-    wy2 = p2r.y + 102
-    if spr2:
-        spr2_s = pygame.transform.scale(spr2, (40, int(40 * spr2.get_height() / spr2.get_width())))
-        screen.blit(spr2_s, (p2r.x + PAD, wy2))
-    draw_text_shadow(screen, p2.weapon.name, SMALL_FONT, p2.weapon.color, (p2r.x + 62, wy2 + 2))
-    if p2.weapon.projectile:
-        ammo2_col = (255, 200, 80) if p2.display_ammo() != "∞" and p2.ammo <= 3 else (200, 200, 200)
-        draw_text_shadow(screen, f"Ammo: {p2.display_ammo()}", SMALL_FONT, ammo2_col, (p2r.x + 62, wy2 + 24))
 
-    # ── Map name — top-center ──
-    map_label = SMALL_FONT.render(arena.map.name, True, (220, 220, 255))
-    map_label_rect = map_label.get_rect(center=(WIDTH // 2, 32))
-    draw_text_shadow(screen, arena.map.name, SMALL_FONT, (220, 220, 255), map_label_rect.topleft, shadow=(2, 2))
+def read_input(keys, scheme, mouse=False):
+    on = lambda name: any(keys[k] for k in scheme[name])
+    melee, shoot = on("melee"), on("shoot")
+    if mouse:
+        left, _middle, right = pygame.mouse.get_pressed()
+        melee, shoot = melee or left, shoot or right
+    return PlayerInput(on("right") - on("left"), on("down") - on("up"), on("sprint"), on("dash"), melee, shoot)
 
-    # ── Controls reminder — bottom-center, compact ──
-    bottom_r = pygame.Rect(WIDTH // 2 - 480, HEIGHT - 52, 960, 38)
-    draw_panel(screen, bottom_r, (6, 6, 18), 180, 10, (50, 50, 90))
-    ctrl = TINY_FONT.render(
-        "P1: WASD Move  LSHIFT Sprint  Q Dash  F Melee  E Shoot        "
-        "P2: Arrows Move  RSHIFT Sprint  / Dash  RCTRL Melee  . Shoot",
-        True, (140, 140, 180))
-    screen.blit(ctrl, ctrl.get_rect(center=bottom_r.center))
+
+def input_from_tuple(t):
+    return PlayerInput(*t)
+
 
 # ─────────────────────────────────────────────
-#  MAIN
+#  MATCH  (rounds + the simulation step shared by every mode)
 # ─────────────────────────────────────────────
-def main():
-    pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Arena Fighters")
-    clock = pygame.time.Clock()
+ROUNDS_TO_WIN = 2
+MAX_ROUNDS = 5
+ROUND_FRAMES = 90 * FPS
+COUNTDOWN_FRAMES = 150
+KO_FRAMES = 170
+HITSTOP_FRAMES = 4
 
-    TITLE_FONT  = pygame.font.SysFont("arialblack", 96)
-    HEADER_FONT = pygame.font.SysFont("arialblack", 48)
-    MENU_FONT   = pygame.font.SysFont(None, 46)
-    BODY_FONT   = pygame.font.SysFont("arialblack", 22)
-    SMALL_FONT  = pygame.font.SysFont(None, 28)
-    TINY_FONT   = pygame.font.SysFont(None, 22)
 
-    MENU, GAME, GAME_OVER, PAUSE = 0, 1, 2, 3
-    state = MENU
-    selected_map = 0
-    winner_text = ""
-    winner_color = (255, 220, 80)
+def make_players():
+    p1 = Player(0, 0, (100, 180, 240), (80, 160, 255))
+    p2 = Player(0, 0, (240, 140, 100), (255, 120, 60))
+    return p1, p2
 
-    # menu background
-    menu_bg = pygame.Surface((WIDTH, HEIGHT))
-    for y in range(HEIGHT):
-        t = y / HEIGHT
-        c = (int(8 + t * 22), int(8 + t * 20), int(30 + t * 60))
-        pygame.draw.line(menu_bg, c, (0, y), (WIDTH, y))
-    for gx in range(0, WIDTH, 80):
-        pygame.draw.line(menu_bg, (30, 30, 60), (gx, 0), (gx, HEIGHT))
-    for gy in range(0, HEIGHT, 80):
-        pygame.draw.line(menu_bg, (30, 30, 60), (0, gy), (WIDTH, gy))
 
-    BTN_W, BTN_H = 380, 72
-    cx = WIDTH // 2
-    start_btn   = Button("Start Battle", cx - BTN_W // 2, HEIGHT // 2 + 80, BTN_W, BTN_H,
-                         (35, 30, 70), (180, 140, 255))
-    exit_btn    = Button("Exit",          cx - BTN_W // 2, HEIGHT // 2 + 170, BTN_W, BTN_H,
-                         (60, 20, 20), (220, 80, 80))
-    rematch_btn = Button("Rematch",      cx - BTN_W // 2, HEIGHT // 2 + 30,  BTN_W, BTN_H,
-                         (35, 30, 70), (180, 140, 255))
-    menu_btn    = Button("Main Menu",    cx - BTN_W // 2, HEIGHT // 2 + 120, BTN_W, BTN_H,
-                         (20, 40, 60), (80, 180, 255))
-    go_exit_btn = Button("Exit",          cx - BTN_W // 2, HEIGHT // 2 + 210, BTN_W, BTN_H,
-                         (60, 20, 20), (220, 80, 80))
-    resume_btn  = Button("Resume",        cx - BTN_W // 2, HEIGHT // 2 + 10,  BTN_W, BTN_H,
-                         (35, 30, 70), (180, 140, 255))
-    pause_menu_btn = Button("Main Menu",   cx - BTN_W // 2, HEIGHT // 2 + 100, BTN_W, BTN_H,
-                         (20, 40, 60), (80, 180, 255))
-    pause_exit_btn = Button("Exit",        cx - BTN_W // 2, HEIGHT // 2 + 190, BTN_W, BTN_H,
-                         (60, 20, 20), (220, 80, 80))
+class Match:
+    """
+    Owns one best-of-3 match.  step() runs exactly the same per-frame game
+    logic as the original game loop, and records what happened in
+    self.events so the renderer (local or on a network client) can play
+    particles and sounds.
+    """
 
-    MAP_BW, MAP_BH = 330, 64
-    map_btns = [
-        Button(MAP_NAMES[i],
-               cx - 700 + i * 352, HEIGHT // 2 - 60,
-               MAP_BW, MAP_BH,
-               [(30,40,30),(50,28,10),(20,18,50),(5,5,20)][i],
-               [(80,220,80),(255,140,40),(160,120,255),(0,220,200)][i])
-        for i in range(4)
-    ]
+    def __init__(self, map_index, labels=("P1", "P2")):
+        self.labels = labels
+        self.p1, self.p2 = make_players()
+        self.arena = Arena(self.p1, self.p2, map_index)
+        self.score = [0, 0]
+        self.round = 1
+        self.match_winner = 0
+        self.events = []
+        self.stats = [dict(dmg=0, hits=0, shots=0, pickups=0) for _ in range(2)]
+        self._start_round()
 
-    def make_players():
-        p1 = Player(0, 0, (100, 180, 240), (80, 160, 255))
-        p2 = Player(0, 0, (240, 140, 100), (255, 120, 60))
-        return p1, p2
+    def _start_round(self):
+        self.p1, self.p2 = make_players()
+        self.p1.label, self.p2.label = self.labels
+        self.arena.player1, self.arena.player2 = self.p1, self.p2
+        self.arena.switch_map(self.arena.map_index)
+        self.bullets = []
+        self.round_timer = ROUND_FRAMES
+        self.phase = "countdown"
+        self.phase_timer = COUNTDOWN_FRAMES
+        self.round_winner = 0
+        self.ko_reason = ""
+        self.freeze = 0
+        self.fight_frames = 0
 
-    p1, p2 = make_players()
-    arena = Arena(p1, p2, selected_map)
-    bullets = []
-    particles = []
+    def players(self):
+        return self.p1, self.p2
 
-    def reset_game():
-        nonlocal p1, p2, arena, bullets, particles, winner_text
-        p1, p2 = make_players()
-        arena = Arena(p1, p2, selected_map)
-        bullets = []; particles = []; winner_text = ""
-
-    def spawn_particles(x, y, color, n=12):
-        for _ in range(n): particles.append(Particle(x, y, color))
-
-    tick = 0
-    running = True
-
-    while running:
-        tick += 1
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-            if state == MENU:
-                if start_btn.clicked(event):
-                    arena.switch_map(selected_map); reset_game(); state = GAME
-                if exit_btn.clicked(event): running = False
-                for i, mb in enumerate(map_btns):
-                    if mb.clicked(event): selected_map = i
-
-            elif state == GAME_OVER:
-                if rematch_btn.clicked(event): reset_game(); state = GAME
-                if menu_btn.clicked(event): state = MENU
-                if go_exit_btn.clicked(event): running = False
-            elif state == PAUSE:
-                if resume_btn.clicked(event): state = GAME
-                if pause_menu_btn.clicked(event): state = MENU
-                if pause_exit_btn.clicked(event): running = False
-
-            if event.type == pygame.KEYDOWN:
-                if state == GAME and event.key == pygame.K_ESCAPE:
-                    state = PAUSE
-                elif state == PAUSE and event.key == pygame.K_ESCAPE:
-                    state = GAME
-
-        keys = pygame.key.get_pressed()
-
-        # ── MENU ──
-        if state == MENU:
-            screen.blit(menu_bg, (0, 0))
-            if tick % 4 == 0:
-                particles.append(Particle(random.randint(0, WIDTH), random.randint(0, HEIGHT), (180, 160, 255)))
-            for pt in particles[:]:
-                pt.update(); pt.draw(screen)
-                if pt.life <= 0: particles.remove(pt)
-
-            # title
-            title_surf = TITLE_FONT.render("ARENA FIGHTERS", True, (220, 210, 255))
-            tx = cx - title_surf.get_width() // 2
-            draw_text_shadow(screen, "ARENA FIGHTERS", TITLE_FONT, (220, 210, 255), (tx, 60))
-            sub = SMALL_FONT.render("Choose your arena and fight!", True, (180, 180, 220))
-            screen.blit(sub, sub.get_rect(center=(cx, 178)))
-
-            # weapon showcase strip
-            strip_r = pygame.Rect(cx - 520, 210, 1040, 90)
-            draw_panel(screen, strip_r, (10, 10, 30), 180, 12, (70, 70, 110))
-            wlabel = TINY_FONT.render("AVAILABLE WEAPONS", True, (160, 160, 200))
-            screen.blit(wlabel, wlabel.get_rect(center=(cx, 222)))
-            for wi, wt in enumerate(WEAPON_TYPES):
-                spr = wt.get_sprite()
-                wx_center = cx - 440 + wi * 220
-                if spr:
-                    spr_big = pygame.transform.scale(spr, (56, int(56 * spr.get_height() / spr.get_width())))
-                    screen.blit(spr_big, spr_big.get_rect(center=(wx_center, 258)))
-                wname = TINY_FONT.render(wt.name, True, wt.color)
-                screen.blit(wname, wname.get_rect(center=(wx_center, 282)))
-
-            # map buttons
-            map_section_label = SMALL_FONT.render("SELECT MAP", True, (180, 180, 220))
-            screen.blit(map_section_label, map_section_label.get_rect(center=(cx, HEIGHT // 2 - 90)))
-            for i, mb in enumerate(map_btns):
-                is_active = (i == selected_map)
-                ac = mb.accent if is_active else (70, 70, 100)
-                if is_active:
-                    gr = mb.rect.inflate(16, 16)
-                    gs = pygame.Surface((gr.width, gr.height), pygame.SRCALPHA)
-                    pygame.draw.rect(gs, (*mb.accent, 60), (0, 0, gr.width, gr.height), border_radius=20)
-                    screen.blit(gs, gr.topleft)
-                mb.draw(screen, MENU_FONT, ac)
-                desc = TINY_FONT.render(MAP_DESCRIPTIONS[i], True, (160, 160, 190))
-                screen.blit(desc, desc.get_rect(center=(mb.rect.centerx, mb.rect.bottom + 18)))
-
-            # control guide
-            ctrl_r = pygame.Rect(cx - 580, HEIGHT - 170, 1160, 100)
-            draw_panel(screen, ctrl_r, (8, 8, 22), 200, 12, (60, 60, 100))
-            ctrl_title = TINY_FONT.render("CONTROLS", True, (160, 160, 200))
-            screen.blit(ctrl_title, ctrl_title.get_rect(center=(cx, HEIGHT - 158)))
-            for li, (tag, txt, col) in enumerate([
-                ("P1", "WASD Move  |  LSHIFT Sprint  |  Q Dash  |  F Melee  |  E Shoot", (140, 200, 255)),
-                ("P2", "Arrows Move  |  RSHIFT Sprint  |  / Dash  |  RCTRL Melee  |  . Shoot", (255, 180, 120)),
-            ]):
-                ts = SMALL_FONT.render(f"[{tag}]  {txt}", True, col)
-                screen.blit(ts, ts.get_rect(center=(cx, HEIGHT - 130 + li * 34)))
-
-            start_btn.draw(screen, MENU_FONT)
-            exit_btn.draw(screen, MENU_FONT)
-
-            if keys[pygame.K_RETURN]: arena.switch_map(selected_map); reset_game(); state = GAME
-            if keys[pygame.K_ESCAPE]: running = False
-
-        # ── GAME ──
-        elif state == GAME:
-            arena.update()
-
-            dx1 = keys[pygame.K_d] - keys[pygame.K_a]
-            dy1 = keys[pygame.K_s] - keys[pygame.K_w]
-            sprint1 = keys[pygame.K_LSHIFT]
-            if keys[pygame.K_q]: p1.start_dash(dx1, dy1)
-            if keys[pygame.K_f]: p1.start_attack(dx1, dy1)
-            if keys[pygame.K_e]:
-                b = p1.start_shoot()
-                if b: bullets.append(b)
-            p1.move(dx1, dy1, sprint1, arena)
-
-            dx2 = keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]
-            dy2 = keys[pygame.K_DOWN]  - keys[pygame.K_UP]
-            sprint2 = keys[pygame.K_RSHIFT]
-            if keys[pygame.K_SLASH] or keys[pygame.K_QUESTION]: p2.start_dash(dx2, dy2)
-            if keys[pygame.K_RCTRL]: p2.start_attack(dx2, dy2)
-            if keys[pygame.K_PERIOD]:
-                b = p2.start_shoot()
-                if b: bullets.append(b)
-            p2.move(dx2, dy2, sprint2, arena)
-
-            p1.update(); p2.update()
-            arena.resolve_obstacle_collision(p1)
-            arena.resolve_obstacle_collision(p2)
-            resolve_player_collision(p1, p2)
-
-            for attacker, defender in [(p1, p2), (p2, p1)]:
-                if attacker.attack_active() and not attacker.attack_hit_registered:
-                    ax = attacker.x + attacker.facing_dx * attacker.attack_range
-                    ay = attacker.y + attacker.facing_dy * attacker.attack_range
-                    if defender.collides_with(ax, ay, 20):
-                        defender.take_hit(attacker.attack_damage)
-                        attacker.attack_hit_registered = True
-                        spawn_particles(defender.x, defender.y, (255, 80, 80))
-
-            for pickup in arena.weapon_pickups[:]:
-                if pickup.check_pickup(p1):
-                    spawn_particles(pickup.x, pickup.y, pickup.weapon.color, 10)
-                    p1.pick_weapon(pickup.weapon); arena.weapon_pickups.remove(pickup)
-                elif pickup.check_pickup(p2):
-                    spawn_particles(pickup.x, pickup.y, pickup.weapon.color, 10)
-                    p2.pick_weapon(pickup.weapon); arena.weapon_pickups.remove(pickup)
-
-            for bullet in bullets[:]:
-                bullet.update(); hit = False
-                if not arena.map.is_within_bounds(bullet.x, bullet.y, bullet.radius):
-                    hit = True
-                elif arena.map.collides_with_obstacle(bullet.x, bullet.y, bullet.radius):
-                    spawn_particles(bullet.x, bullet.y, bullet.color, 6); hit = True
-                elif bullet.owner is not p1 and p1.collides_with(bullet.x, bullet.y, bullet.radius):
-                    p1.take_hit(bullet.damage); spawn_particles(p1.x, p1.y, (255, 80, 80), 10); hit = True
-                elif bullet.owner is not p2 and p2.collides_with(bullet.x, bullet.y, bullet.radius):
-                    p2.take_hit(bullet.damage); spawn_particles(p2.x, p2.y, (255, 80, 80), 10); hit = True
-                if hit: bullets.remove(bullet)
-
-            for pt in particles[:]:
-                pt.update()
-                if pt.life <= 0: particles.remove(pt)
-
-            arena.draw(screen, tick)
-            for pt in particles: pt.draw(screen)
-            for b in bullets: b.draw(screen)
-            p1.draw(screen); p2.draw(screen)
-
-            draw_game_hud(screen, p1, p2, arena, tick, BODY_FONT, SMALL_FONT, TINY_FONT)
-
-            if p1.is_dead() or p2.is_dead():
-                if p1.is_dead():
-                    winner_text = "PLAYER 2 WINS!"; winner_color = (255, 170, 80)
-                    spawn_particles(p2.x, p2.y, (255, 220, 60), 30)
+    # ── per-frame update ───────────────────────────────────────
+    def step(self, in1, in2):
+        self.events = []
+        if self.phase == "countdown":
+            if self.phase_timer % 50 == 0:
+                self.events.append(["count", self.phase_timer // 50])
+            self.phase_timer -= 1
+            if self.phase_timer <= 0:
+                self.phase = "fight"
+                self.events.append(["fight"])
+        elif self.phase == "fight":
+            self.fight_frames += 1
+            if self.freeze > 0:
+                self.freeze -= 1
+                return
+            self._simulate(in1, in2)
+            self.round_timer -= 1
+            self._check_round_end()
+        elif self.phase == "ko":
+            self.phase_timer -= 1
+            for pl in (self.p1, self.p2):
+                pl.update()
+            if self.phase_timer <= 0:
+                if self.match_winner:
+                    self.phase = "over"
+                    self.events.append(["over", self.match_winner])
                 else:
-                    winner_text = "PLAYER 1 WINS!"; winner_color = (100, 210, 255)
-                    spawn_particles(p1.x, p1.y, (100, 200, 255), 30)
-                state = GAME_OVER
+                    self.round += 1
+                    self._start_round()
 
-        # ── GAME OVER ──
-        elif state == GAME_OVER:
-            arena.draw(screen, tick)
-            for pt in particles[:]:
-                pt.update(); pt.draw(screen)
-                if pt.life <= 0: particles.remove(pt)
+    def _simulate(self, in1, in2):
+        arena, p1, p2 = self.arena, self.p1, self.p2
+        ev = self.events
+        arena.update()
+        for idx, (pl, inp) in enumerate(((p1, in1), (p2, in2)), start=1):
+            if inp.dash:
+                was = pl.dash_timer
+                pl.start_dash(inp.dx, inp.dy)
+                if pl.dash_timer > 0 and was == 0:
+                    ev.append(["dash", idx])
+            if inp.melee:
+                was = pl.attack_timer
+                pl.start_attack(inp.dx, inp.dy)
+                if pl.attack_timer > 0 and was == 0:
+                    ev.append(["swing", idx])
+            if inp.shoot:
+                b = pl.start_shoot()
+                if b:
+                    self.bullets.append(b)
+                    self.stats[idx - 1]["shots"] += 1
+                    ev.append(["shoot", round(b.x), round(b.y), b.widx])
+            pl.move(inp.dx, inp.dy, bool(inp.sprint), arena)
 
-            if tick % 18 == 0:
-                for _ in range(16):
-                    particles.append(Particle(
-                        random.randint(WIDTH // 4, 3 * WIDTH // 4),
-                        random.randint(HEIGHT // 4, 3 * HEIGHT // 4),
-                        random.choice([(255,220,60),(100,220,255),(255,100,180),(80,255,120)])))
+        p1.update(); p2.update()
+        arena.resolve_obstacle_collision(p1)
+        arena.resolve_obstacle_collision(p2)
+        resolve_player_collision(p1, p2)
 
-            overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            overlay.fill((96, 96, 96, 160))
-            screen.blit(overlay, (0, 0))
+        for a_idx, (attacker, defender) in enumerate(((p1, p2), (p2, p1)), start=1):
+            if attacker.attack_active() and not attacker.attack_hit_registered:
+                ax = attacker.x + attacker.facing_dx * attacker.attack_range
+                ay = attacker.y + attacker.facing_dy * attacker.attack_range
+                if defender.collides_with(ax, ay, 20):
+                    defender.take_hit(attacker.attack_damage)
+                    attacker.attack_hit_registered = True
+                    self._record_hit(a_idx, attacker.attack_damage)
+                    ev.append(["hit", round(defender.x), round(defender.y), attacker.attack_damage, 3 - a_idx, 1])
+                    self.freeze = HITSTOP_FRAMES
 
-            tw = TITLE_FONT.render(winner_text, True, winner_color)
-            screen.blit(tw, tw.get_rect(center=(cx, HEIGHT // 2 - 100)))
+        for pickup in arena.weapon_pickups[:]:
+            for idx, pl in ((1, p1), (2, p2)):
+                if pickup.check_pickup(pl):
+                    pl.pick_weapon(pickup.weapon)
+                    arena.weapon_pickups.remove(pickup)
+                    self.stats[idx - 1]["pickups"] += 1
+                    ev.append(["pickup", round(pickup.x), round(pickup.y), weapon_index(pickup.weapon), idx])
+                    break
 
-            sub2 = HEADER_FONT.render("GG!", True, (200, 200, 255))
-            screen.blit(sub2, sub2.get_rect(center=(cx, HEIGHT // 2 - 20)))
+        for bullet in self.bullets[:]:
+            bullet.update(); hit = False
+            if not arena.map.is_within_bounds(bullet.x, bullet.y, bullet.radius):
+                hit = True
+            elif arena.map.collides_with_obstacle(bullet.x, bullet.y, bullet.radius):
+                ev.append(["impact", round(bullet.x), round(bullet.y), bullet.widx]); hit = True
+            else:
+                for idx, pl in ((1, p1), (2, p2)):
+                    if bullet.owner is not pl and pl.collides_with(bullet.x, bullet.y, bullet.radius):
+                        pl.take_hit(bullet.damage)
+                        self._record_hit(3 - idx, bullet.damage)
+                        ev.append(["hit", round(pl.x), round(pl.y), bullet.damage, idx, 0])
+                        hit = True
+                        break
+            if hit: self.bullets.remove(bullet)
 
-            rematch_btn.draw(screen, MENU_FONT)
-            menu_btn.draw(screen, MENU_FONT)
-            go_exit_btn.draw(screen, MENU_FONT)
+    def _record_hit(self, attacker_idx, dmg):
+        st = self.stats[attacker_idx - 1]
+        st["dmg"] += dmg
+        st["hits"] += 1
 
-        # ── PAUSE ──
-        elif state == PAUSE:
-            arena.draw(screen, tick)
-            for pt in particles:
-                pt.draw(screen)
-            for b in bullets:
-                b.draw(screen)
-            p1.draw(screen); p2.draw(screen)
-            draw_game_hud(screen, p1, p2, arena, tick, BODY_FONT, SMALL_FONT, TINY_FONT)
+    def _check_round_end(self):
+        d1, d2 = self.p1.is_dead(), self.p2.is_dead()
+        if not (d1 or d2 or self.round_timer <= 0):
+            return
+        if d1 and d2:
+            w = 3
+        elif d1 or d2:
+            w = 2 if d1 else 1
+        else:
+            h1, h2 = self.p1.health, self.p2.health
+            w = 1 if h1 > h2 else 2 if h2 > h1 else 3
+        self.ko_reason = "ko" if (d1 or d2) else "time"
+        self.round_winner = w
+        if w in (1, 2):
+            self.score[w - 1] += 1
+        if max(self.score) >= ROUNDS_TO_WIN:
+            self.match_winner = 1 if self.score[0] > self.score[1] else 2
+        elif self.round >= MAX_ROUNDS:
+            self.match_winner = 1 if self.score[0] > self.score[1] else 2 if self.score[1] > self.score[0] else 3
+        loser = self.p2 if w == 1 else self.p1
+        self.events.append(["ko", w, self.ko_reason, round(loser.x), round(loser.y)])
+        self.phase = "ko"
+        self.phase_timer = KO_FRAMES
+        self.bullets = []
 
-            overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            overlay.fill((96, 96, 96, 150))
-            screen.blit(overlay, (0, 0))
+    # ── network snapshot (host → client) ───────────────────────
+    def snapshot(self):
+        def pack(p):
+            return [round(p.x, 1), round(p.y, 1), round(p.facing_dx, 3), round(p.facing_dy, 3),
+                    p.health, round(p.stamina, 1), p.hit_timer, p.attack_timer, p.dash_timer,
+                    weapon_index(p.weapon), p.ammo, p.cooldown_timer]
+        return {
+            "t": "s", "ph": self.phase, "pt": self.phase_timer, "rt": self.round_timer,
+            "ff": self.fight_frames, "sc": self.score, "r": self.round, "rw": self.round_winner,
+            "mw": self.match_winner, "kr": self.ko_reason, "m": self.arena.map_index,
+            "p": [pack(self.p1), pack(self.p2)],
+            "b": [[round(b.x, 1), round(b.y, 1), round(b.dx, 3), round(b.dy, 3), b.speed, b.widx,
+                   1 if b.owner is self.p1 else 2] for b in self.bullets],
+            "w": [[w.id, w.x, w.y, weapon_index(w.weapon), round(w.bob, 2)] for w in self.arena.weapon_pickups],
+            "st": self.stats if self.phase == "over" else None,
+            "ev": self.events,
+        }
 
-            pause_title = TITLE_FONT.render("PAUSED", True, (230, 230, 255))
-            screen.blit(pause_title, pause_title.get_rect(center=(cx, HEIGHT // 2 - 90)))
-            pause_hint = SMALL_FONT.render("Press Esc to resume", True, (180, 180, 220))
-            screen.blit(pause_hint, pause_hint.get_rect(center=(cx, HEIGHT // 2 - 28)))
+    def apply_snapshot(self, snap):
+        if snap["m"] != self.arena.map_index:
+            self.arena.switch_map(snap["m"])
+        if snap["r"] != self.round or (snap["ph"] == "countdown" and self.phase not in ("countdown",)):
+            self._start_round()
+        self.phase, self.phase_timer = snap["ph"], snap["pt"]
+        self.round_timer, self.fight_frames = snap["rt"], snap["ff"]
+        self.score, self.round = snap["sc"], snap["r"]
+        self.round_winner, self.match_winner, self.ko_reason = snap["rw"], snap["mw"], snap["kr"]
+        if snap.get("st"):
+            self.stats = snap["st"]
+        for p, d in zip((self.p1, self.p2), snap["p"]):
+            ox, oy = p.x, p.y
+            (p.x, p.y, p.facing_dx, p.facing_dy, p.health, p.stamina,
+             p.hit_timer, p.attack_timer, p.dash_timer, widx, p.ammo, p.cooldown_timer) = d
+            if p.dash_timer > 0:
+                p.trail.append((ox, oy))
+                p.trail = p.trail[-8:]
+            else:
+                p.trail = []
+            if weapon_index(p.weapon) != widx:
+                p.weapon = weapon_from_index(widx)
+        self.bullets = []
+        for x, y, dx, dy, speed, widx, owner in snap["b"]:
+            w = weapon_from_index(widx)
+            b = Bullet(x, y, dx, dy, speed, w.damage, w.color, w.glow, self.p1 if owner == 1 else self.p2, widx)
+            b.trail = [(x - dx * speed * k, y - dy * speed * k) for k in range(6, 0, -1)]
+            self.bullets.append(b)
+        old = {w.id: w for w in self.arena.weapon_pickups}
+        pickups = []
+        for pid, x, y, widx, bob in snap["w"]:
+            pk = old.get(pid)
+            if pk is None:
+                pk = WeaponPickup(weapon_from_index(widx), x, y)
+                pk.id, pk.bob = pid, bob
+            pickups.append(pk)
+        self.arena.weapon_pickups = pickups
 
-            resume_btn.draw(screen, MENU_FONT)
-            pause_menu_btn.draw(screen, MENU_FONT)
-            pause_exit_btn.draw(screen, MENU_FONT)
 
+# ─────────────────────────────────────────────
+#  DRAW IN-GAME HUD
+# ─────────────────────────────────────────────
+def _player_panel(screen, rect, p, title, title_color, bg, border, right_aligned):
+    PAD = 18
+    PW = rect.width
+    draw_panel(screen, rect, bg, 215, 14, border)
+    dot_x = rect.right - 22 if right_aligned else rect.x + 22
+    pygame.draw.circle(screen, p.color, (dot_x, rect.y + 24), 10)
+    pygame.draw.circle(screen, p.glow_color, (dot_x, rect.y + 24), 10, 2)
+    label = get_font(22).render(title, True, title_color)
+    lx = rect.right - 38 - label.get_width() if right_aligned else rect.x + 38
+    screen.blit(get_font(22).render(title, True, (0, 0, 0)), (lx + 2, rect.y + 12))
+    screen.blit(label, (lx, rect.y + 10))
+    tiny = get_font(16, bold=False)
+    small = get_font(21, bold=False)
+    draw_text_shadow(screen, "HP", tiny, (170, 230, 170), (rect.x + PAD, rect.y + 50))
+    hp = max(0, p.health / p.max_health)
+    hp_col = (int(40 + 200 * (1 - hp)), int(180 * hp + 40), 50)
+    draw_hud_bar(screen, rect.x + 48, rect.y + 52, PW - 66, 16, hp, hp_col, border=(90, 140, 90))
+    hp_txt = tiny.render(f"{int(p.health)}/{p.max_health}", True, (230, 245, 230))
+    screen.blit(hp_txt, (rect.x + 48 + (PW - 66) - hp_txt.get_width() - 8, rect.y + 52))
+    draw_text_shadow(screen, "SP", tiny, (120, 190, 240), (rect.x + PAD, rect.y + 76))
+    draw_hud_bar(screen, rect.x + 48, rect.y + 79, PW - 66, 9, p.stamina / p.max_stamina,
+                 (70, 180, 235), border=(60, 120, 170))
+    # dash readiness
+    dash_frac = 1 - p.cooldown_timer / p.dash_cooldown
+    draw_text_shadow(screen, "DASH", tiny, (200, 200, 230), (rect.x + PAD, rect.y + 96))
+    draw_hud_bar(screen, rect.x + 70, rect.y + 99, 90, 7, dash_frac,
+                 (255, 230, 120) if dash_frac >= 1 else (150, 140, 110), border=(110, 110, 130), radius=3)
+    spr = p.weapon.get_sprite()
+    wy = rect.y + 116
+    if spr:
+        spr_s = cached(("hudspr", p.weapon.name), lambda: pygame.transform.smoothscale(spr, (40, int(40 * spr.get_height() / spr.get_width()))))
+        screen.blit(spr_s, (rect.x + PAD, wy + 8))
+    draw_text_shadow(screen, p.weapon.name, small, p.weapon.color, (rect.x + 66, wy + 2))
+    if p.weapon.projectile:
+        ammo_col = (255, 200, 80) if p.ammo >= 0 and p.ammo <= 3 else (210, 210, 210)
+        draw_text_shadow(screen, f"Ammo: {p.display_ammo()}", small, ammo_col, (rect.x + 66, wy + 22))
+
+
+def draw_game_hud(screen, match, titles, hint, tick):
+    PAD, PW, PH = 18, 320, 168
+    p1, p2 = match.p1, match.p2
+    _player_panel(screen, pygame.Rect(PAD, PAD, PW, PH), p1, titles[0], (130, 205, 255),
+                  (8, 16, 30), (80, 140, 200), False)
+    _player_panel(screen, pygame.Rect(WIDTH - PAD - PW, PAD, PW, PH), p2, titles[1], (255, 180, 110),
+                  (30, 14, 8), (200, 130, 80), True)
+
+    # ── scoreboard / timer — top-center ──
+    cw, ch = 280, 96
+    cr = pygame.Rect(WIDTH // 2 - cw // 2, PAD, cw, ch)
+    draw_panel(screen, cr, (10, 10, 24), 215, 16, (110, 100, 180))
+    draw_text_center(screen, f"ROUND {match.round}", get_font(16), (190, 180, 240), (cr.centerx, cr.y + 18))
+    secs = max(0, math.ceil(match.round_timer / FPS))
+    tcol = (255, 90, 90) if secs <= 10 and match.phase == "fight" and tick % 30 < 18 else (245, 245, 255)
+    draw_text_center(screen, f"{secs}", get_font(40), tcol, (cr.centerx, cr.y + 56))
+    for side, (p, sc) in enumerate(((p1, match.score[0]), (p2, match.score[1]))):
+        for i in range(ROUNDS_TO_WIN):
+            x = cr.x + 36 + i * 30 if side == 0 else cr.right - 36 - i * 30
+            filled = i < sc
+            if filled:
+                add_glow(screen, p.glow_color, x, cr.y + 56, 22, 0.8)
+            pygame.draw.circle(screen, p.glow_color if filled else (40, 40, 60), (x, cr.y + 56), 9)
+            pygame.draw.circle(screen, (230, 230, 255), (x, cr.y + 56), 9, 2)
+    draw_text_center(screen, match.arena.map.name, get_font(18, bold=False), (210, 210, 245), (cr.centerx, cr.bottom + 18))
+
+    # ── controls reminder — bottom-center ──
+    hint_img = get_font(18, bold=False).render(hint, True, (170, 170, 210))
+    bw = hint_img.get_width() + 48
+    bottom_r = pygame.Rect(WIDTH // 2 - bw // 2, HEIGHT - 50, bw, 36)
+    draw_panel(screen, bottom_r, (6, 6, 18), 170, 10, (50, 50, 90))
+    screen.blit(hint_img, hint_img.get_rect(center=bottom_r.center))
+
+
+def draw_banners(screen, match, titles):
+    cx, cy = WIDTH // 2, HEIGHT // 2 - 40
+    if match.phase == "countdown":
+        n = max(1, math.ceil(match.phase_timer / 50))
+        t = 1 - (match.phase_timer - (n - 1) * 50) / 50
+        final = match.score[0] == ROUNDS_TO_WIN - 1 and match.score[1] == ROUNDS_TO_WIN - 1
+        head = banner_text("FINAL ROUND" if final else f"ROUND {match.round}", 54, (255, 230, 150), (255, 160, 40))
+        blit_center(screen, head, cx, cy - 120)
+        img = banner_text(str(n), 150, (255, 255, 255), (140, 120, 255))
+        scale = 1.5 - 0.5 * min(1.0, t * 5)
+        img = pygame.transform.rotozoom(img, 0, scale)
+        img.set_alpha(int(255 * min(1.0, (1 - t) * 3)))
+        blit_center(screen, img, cx, cy + 20)
+    elif match.phase == "fight" and match.fight_frames < 55:
+        t = match.fight_frames / 55
+        img = banner_text("FIGHT!", 140, (255, 240, 200), (255, 90, 40))
+        img = pygame.transform.rotozoom(img, 0, 0.8 + 0.4 * min(1.0, t * 4))
+        img.set_alpha(int(255 * (1 - t ** 3)))
+        blit_center(screen, img, cx, cy)
+    elif match.phase == "ko":
+        elapsed = KO_FRAMES - match.phase_timer
+        if match.ko_reason == "time":
+            word = "TIME!"
+        else:
+            word = "DOUBLE K.O." if match.round_winner == 3 else "K.O.!"
+        img = banner_text(word, 150, (255, 250, 240), (255, 40, 40))
+        scale = max(1.0, 2.2 - elapsed * 0.08)
+        blit_center(screen, pygame.transform.rotozoom(img, 0, scale), cx, cy)
+        if elapsed > 45:
+            if match.round_winner in (1, 2):
+                who = titles[match.round_winner - 1]
+                col = (130, 205, 255) if match.round_winner == 1 else (255, 180, 110)
+                sub = banner_text(f"{who} takes the round", 44, col)
+            else:
+                sub = banner_text("Draw round", 44, (230, 230, 230))
+            blit_center(screen, sub, cx, cy + 110)
+
+
+# ─────────────────────────────────────────────
+#  SETTINGS FILE
+# ─────────────────────────────────────────────
+DEFAULT_SETTINGS = dict(map=0, mode="ai", difficulty="Medium", relay="", address="", muted=False)
+
+
+def load_settings():
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data.update({k: v for k, v in json.load(f).items() if k in DEFAULT_SETTINGS})
+    except (OSError, ValueError):
+        pass
+    return data
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+# ─────────────────────────────────────────────
+#  WINDOW
+# ─────────────────────────────────────────────
+class Display:
+    """
+    The game always draws on a 1920×1080 canvas.  The window can be any size
+    (laptops, 4K, fullscreen): the canvas is scaled to fit, letterboxed, and
+    mouse positions are mapped back.  At exactly 1920×1080 the canvas *is* the
+    window, so there is no scaling cost at all.
+    """
+
+    def __init__(self, fullscreen=False):
+        self.fullscreen = fullscreen
+        self.windowed_size = self._fit_window()
+        self.fast = False                    # nearest-neighbour scaling on slow machines
+        self.slow_frames = 0
+        self._canvas_surf = None
+        self._open()
+
+    @staticmethod
+    def _fit_window():
+        try:
+            dw, dh = pygame.display.get_desktop_sizes()[0]
+        except (pygame.error, IndexError, AttributeError):
+            return WIDTH, HEIGHT
+        if dw >= WIDTH and dh >= HEIGHT + 60:
+            return WIDTH, HEIGHT
+        scale = min(dw * 0.94 / WIDTH, dh * 0.86 / HEIGHT)
+        return int(WIDTH * scale), int(HEIGHT * scale)
+
+    def _open(self):
+        if self.fullscreen:
+            pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            pygame.display.set_mode(self.windowed_size, pygame.RESIZABLE)
+        self.layout()
+
+    def layout(self):
+        win = pygame.display.get_surface()
+        ww, wh = win.get_size()
+        if ww < 16 or wh < 16:          # minimised: keep the previous layout
+            return
+        if (ww, wh) == (WIDTH, HEIGHT):
+            self.direct = True
+            self.canvas = win
+            self.rect = win.get_rect()
+            return
+        self.direct = False
+        if self._canvas_surf is None:
+            self._canvas_surf = pygame.Surface((WIDTH, HEIGHT)).convert()
+        self.canvas = self._canvas_surf
+        scale = min(ww / WIDTH, wh / HEIGHT)
+        self.rect = pygame.Rect(0, 0, max(1, int(WIDTH * scale)), max(1, int(HEIGHT * scale)))
+        self.rect.center = (ww // 2, wh // 2)
+        self._scaled = pygame.Surface(self.rect.size).convert()
+        win.fill((0, 0, 0))
+        if not self.fullscreen:
+            self.windowed_size = (ww, wh)
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self._open()
+
+    def present(self, frame_ms):
+        if not self.direct:
+            if frame_ms > 15 and not self.fast:
+                self.slow_frames += 1
+                self.fast = self.slow_frames > 90      # sustained slowness → cheaper scaling
+            win = pygame.display.get_surface()
+            scale = pygame.transform.scale if self.fast else pygame.transform.smoothscale
+            if self.rect.topleft == (0, 0) and self.rect.size == win.get_size():
+                scale(self.canvas, self.rect.size, win)
+            else:
+                scale(self.canvas, self.rect.size, self._scaled)
+                win.blit(self._scaled, self.rect.topleft)
         pygame.display.flip()
-        clock.tick(FPS)
 
-    pygame.quit()
+    def to_canvas(self, pos):
+        if self.direct:
+            return pos
+        x = (pos[0] - self.rect.x) * WIDTH / self.rect.width
+        y = (pos[1] - self.rect.y) * HEIGHT / self.rect.height
+        return int(x), int(y)
+
+
+_display = None
+
+
+def mouse_pos():
+    """Mouse position in canvas (1920×1080) coordinates."""
+    pos = pygame.mouse.get_pos()
+    return _display.to_canvas(pos) if _display else pos
+
+
+def make_icon():
+    s = pygame.Surface((32, 32), pygame.SRCALPHA)
+    pygame.draw.circle(s, (40, 30, 80), (16, 16), 15)
+    pygame.draw.circle(s, (180, 140, 255), (16, 16), 15, 2)
+    pygame.draw.line(s, (235, 235, 255), (9, 23), (23, 9), 4)
+    pygame.draw.line(s, (255, 220, 90), (8, 17), (15, 24), 3)
+    return s
+
+
+# ─────────────────────────────────────────────
+#  APP
+# ─────────────────────────────────────────────
+MODES = [("ai", "VS AI"), ("local", "LOCAL 2P"), ("aivai", "AI VS AI"), ("online", "ONLINE")]
+MODE_BLURBS = {
+    "ai": "You against the trained neural-network AI.",
+    "local": "Two players, one keyboard.",
+    "aivai": "Sit back and watch two AIs fight it out.",
+    "online": "Play a friend over LAN or the internet.",
+}
+DIFF_COLORS = {"Easy": (90, 220, 120), "Medium": (255, 200, 80), "Hard": (255, 80, 80)}
+
+
+class Session:
+    """Everything about the match currently being played."""
+
+    def __init__(self, mode, map_index, difficulty="Medium", peer=None):
+        self.mode = mode
+        self.difficulty = difficulty
+        self.peer = peer
+        self.last_seq = -1
+        self.leave_prompt = False
+        self.map_index = map_index
+        if mode == "local":
+            self.labels, self.titles = ("P1", "P2"), ("PLAYER 1", "PLAYER 2")
+        elif mode == "ai":
+            self.labels, self.titles = ("YOU", f"AI {difficulty.upper()}"), ("YOU", f"AI · {difficulty.upper()}")
+        elif mode == "aivai":
+            self.labels, self.titles = ("BLUE AI", "ORANGE AI"), (f"BLUE AI · {difficulty.upper()}", f"ORANGE AI · {difficulty.upper()}")
+        elif mode == "host":
+            self.labels, self.titles = ("YOU", "RIVAL"), ("YOU", "RIVAL")
+        else:  # client
+            self.labels, self.titles = ("RIVAL", "YOU"), ("RIVAL", "YOU")
+        self.new_match()
+
+    def new_match(self):
+        self.match = Match(self.map_index, self.labels)
+        self.ai = [None, None]
+        if self.mode == "ai":
+            self.ai[1] = AIController(self.difficulty)
+        elif self.mode == "aivai":
+            self.ai = [AIController(self.difficulty), AIController(self.difficulty)]
+
+    def local_side(self):
+        return {"ai": 1, "host": 1, "client": 2}.get(self.mode, 0)
+
+    def hint(self):
+        if self.mode == "local":
+            return ("P1: WASD move · LShift sprint · Q dash · F melee · E shoot        "
+                    "P2: Arrows · RShift sprint · / dash · RCtrl melee · . shoot        Esc pause")
+        if self.mode == "aivai":
+            return "Spectating AI vs AI        Esc pause"
+        esc = "Esc pause" if self.mode == "ai" else "Esc leave"
+        return f"Move WASD/Arrows · Sprint Shift · Dash Q/Space · Melee F/Left click · Shoot E/Right click        {esc}"
+
+    def winner_text(self):
+        w = self.match.match_winner
+        if w == 3:
+            return "DRAW!", (230, 230, 230)
+        col = (110, 200, 255) if w == 1 else (255, 170, 90)
+        if self.mode == "local":
+            return f"PLAYER {w} WINS!", col
+        if self.mode == "aivai":
+            return ("BLUE AI WINS!" if w == 1 else "ORANGE AI WINS!"), col
+        if self.local_side() == w:
+            return "VICTORY!", (255, 220, 90)
+        return ("DEFEAT" if self.mode != "ai" else "THE AI WINS"), (255, 110, 110)
+
+
+class App:
+    def __init__(self, args):
+        pygame.mixer.pre_init(22050, -16, 1, 512)
+        pygame.init()
+        pygame.display.set_caption("Arena Fighters")
+        pygame.display.set_icon(make_icon())
+        global _display
+        self.display = _display = Display(args.fullscreen)
+        self.clock = pygame.time.Clock()
+        self.world = pygame.Surface((WIDTH, HEIGHT)).convert()
+        self.sfx = SoundBank()
+        self.settings = load_settings()
+        self.sfx.muted = bool(self.settings.get("muted"))
+        self.args = args
+        if args.relay is not None:
+            self.settings["relay"] = args.relay
+        self.maps = shared_maps()
+        self.selected_map = args.map if args.map is not None else int(self.settings["map"]) % len(self.maps)
+        self.mode = args.mode if args.mode in dict(MODES) else self.settings["mode"]
+        if self.mode not in dict(MODES):
+            self.mode = "ai"
+        self.difficulty = args.difficulty or self.settings["difficulty"]
+        if self.difficulty not in DIFFICULTIES:
+            self.difficulty = "Medium"
+        self.autostart = args.mode in ("ai", "local", "aivai")
+
+        self.state = "loading"
+        self.load_step = 0
+        self.running = True
+        self.tick = 0
+        self.session = None
+        self.toast_text, self.toast_until = "", 0
+        self.particles, self.texts, self.rings = [], [], []
+        self.shake = 0.0
+        self.flash = 0
+        self.connector = None
+        self.connect_role = ""
+        self.handshake_deadline = 0
+        self.lobby_status = ""
+        self.lobby_error = ""
+        self.beacon = None
+        self.scanner = None
+        self.lan_buttons = []
+        self._build_widgets()
+
+    @property
+    def screen(self):
+        return self.display.canvas
+
+    # ── widgets ────────────────────────────────────────────────
+    def _build_widgets(self):
+        cx = WIDTH // 2
+        self.mode_btns = [Button(label, cx - 640 + i * 320 + 10, 250, 300, 64, (26, 24, 52), (170, 140, 255))
+                          for i, (_m, label) in enumerate(MODES)]
+        self.card_rects = [pygame.Rect(124 + i * 424, 392, 400, 225) for i in range(4)]
+        self.diff_btns = [Button(d, cx - 350 + i * 240, 712, 220, 58, (26, 24, 52), DIFF_COLORS[d])
+                          for i, d in enumerate(DIFFICULTIES)]
+        self.start_btn = Button("START", cx - 190, 800, 380, 76, (40, 30, 80), (190, 150, 255))
+        self.quit_btn = Button("Quit", cx - 120, 892, 240, 52, (60, 20, 20), (220, 80, 80))
+        # game over / pause
+        BW, BH = 380, 72
+        self.rematch_btn = Button("Rematch", cx - BW // 2, HEIGHT // 2 + 130, BW, BH, (35, 30, 70), (180, 140, 255))
+        self.menu_btn = Button("Main Menu", cx - BW // 2, HEIGHT // 2 + 220, BW, BH, (20, 40, 60), (80, 180, 255))
+        self.exit_btn = Button("Exit Game", cx - BW // 2, HEIGHT // 2 + 310, BW, BH, (60, 20, 20), (220, 80, 80))
+        self.resume_btn = Button("Resume", cx - BW // 2, HEIGHT // 2 + 10, BW, BH, (35, 30, 70), (180, 140, 255))
+        self.pause_menu_btn = Button("Main Menu", cx - BW // 2, HEIGHT // 2 + 100, BW, BH, (20, 40, 60), (80, 180, 255))
+        self.pause_exit_btn = Button("Exit Game", cx - BW // 2, HEIGHT // 2 + 190, BW, BH, (60, 20, 20), (220, 80, 80))
+        self.leave_yes_btn = Button("Leave match", cx - BW // 2, HEIGHT // 2 + 20, BW, BH, (60, 20, 20), (220, 80, 80))
+        self.leave_no_btn = Button("Keep playing", cx - BW // 2, HEIGHT // 2 + 110, BW, BH, (35, 30, 70), (180, 140, 255))
+        # lobby
+        self.relay_field = TextField("Relay server  (optional – leave empty for LAN / direct IP)",
+                                     cx - 560, 300, 1120, 60, self.settings.get("relay", ""), "e.g.  my-server.com:7777")
+        self.addr_field = TextField("Join: host IP  –  or room code when using a relay",
+                                    cx - 560, 450, 760, 60, self.settings.get("address", ""), "e.g.  192.168.1.20")
+        self.host_btn = Button("Host Game", cx - 560, 560, 360, 72, (30, 50, 40), (90, 230, 140))
+        self.join_btn = Button("Join", cx + 220, 446, 340, 68, (30, 40, 70), (100, 180, 255))
+        self.back_btn = Button("Back", cx - 120, HEIGHT - 120, 240, 60, (40, 24, 24), (220, 110, 110))
+        self.cancel_btn = Button("Cancel", cx - 160, 860, 320, 64, (60, 20, 20), (220, 80, 80))
+
+    # ── main loop ──────────────────────────────────────────────
+    def run(self):
+        while self.running:
+            self.tick += 1
+            events = []
+            for e in pygame.event.get():
+                if e.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+                    e = pygame.event.Event(e.type, {**e.dict, "pos": self.display.to_canvas(e.pos)})
+                if e.type == pygame.KEYDOWN and (e.key == pygame.K_F11 or
+                                                 (e.key == pygame.K_RETURN and e.mod & pygame.KMOD_ALT)):
+                    self.display.toggle_fullscreen()
+                    continue
+                events.append(e)
+            for e in events:
+                if e.type == pygame.QUIT:
+                    self.running = False
+                elif e.type in (pygame.VIDEORESIZE, pygame.WINDOWSIZECHANGED):
+                    self.display.layout()
+                elif e.type == pygame.KEYDOWN and e.key == pygame.K_m and not self._typing():
+                    self.settings["muted"] = self.sfx.toggle_mute()
+                    self.show_toast("Sound off" if self.sfx.muted else "Sound on", 90)
+                elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                    self._click_sound(e)
+            getattr(self, "state_" + self.state)(events)
+            self._draw_toast()
+            self.display.present(self.clock.get_rawtime())
+            self.clock.tick(FPS)
+        self.shutdown()
+
+    def shutdown(self):
+        self.leave_session(notify=True)
+        self._stop_lobby_net()
+        self.settings.update(map=self.selected_map, mode=self.mode, difficulty=self.difficulty,
+                             relay=self.relay_field.text.strip(), address=self.addr_field.text.strip())
+        save_settings(self.settings)
+        pygame.quit()
+
+    def _typing(self):
+        return self.state == "lobby" and (self.relay_field.focused or self.addr_field.focused)
+
+    def _click_sound(self, e):
+        btns = []
+        if self.state == "menu":
+            btns = self.mode_btns + self.diff_btns + [self.start_btn, self.quit_btn]
+        elif self.state == "lobby":
+            btns = [self.host_btn, self.join_btn, self.back_btn, self.cancel_btn] + [b for b, _ in self.lan_buttons]
+        elif self.state in ("over", "pause"):
+            btns = [self.rematch_btn, self.menu_btn, self.exit_btn, self.resume_btn, self.pause_menu_btn, self.pause_exit_btn]
+        if any(b.rect.collidepoint(e.pos) for b in btns) or (self.state == "menu" and any(r.collidepoint(e.pos) for r in self.card_rects)):
+            self.sfx.play("click")
+
+    def show_toast(self, text, frames=240):
+        self.toast_text, self.toast_until = text, self.tick + frames
+
+    def _draw_toast(self):
+        if self.tick < self.toast_until and self.toast_text:
+            img = get_font(22, bold=False).render(self.toast_text, True, (255, 255, 255))
+            r = pygame.Rect(0, 0, img.get_width() + 40, 50)
+            r.center = (WIDTH // 2, HEIGHT - 140)
+            draw_panel(self.screen, r, (40, 20, 60), 230, 14, (200, 140, 255))
+            self.screen.blit(img, img.get_rect(center=r.center))
+
+    # ── loading ────────────────────────────────────────────────
+    def state_loading(self, events):
+        steps = len(self.maps) + 1
+        self.screen.fill((8, 8, 22))
+        draw_text_center(self.screen, "ARENA FIGHTERS", get_font(88), (225, 215, 255), (WIDTH // 2, HEIGHT // 2 - 80))
+        msg = "Forging the arenas…" if self.load_step < len(self.maps) else "Waking up the AI…"
+        draw_text_center(self.screen, msg, get_font(24, bold=False), (170, 170, 210), (WIDTH // 2, HEIGHT // 2 + 20))
+        bar = pygame.Rect(WIDTH // 2 - 300, HEIGHT // 2 + 60, 600, 16)
+        draw_hud_bar(self.screen, bar.x, bar.y, bar.w, bar.h, self.load_step / steps, (170, 140, 255), border=(110, 100, 180), radius=8)
+        if self.tick < 2:       # let the first frame show before the heavy work
+            return
+        if self.load_step < len(self.maps):
+            self.maps[self.load_step].static_layer()
+        else:
+            load_policy()
+        self.load_step += 1
+        if self.load_step > steps:
+            if self.autostart:
+                self.start_offline(self.mode)
+            elif self.args.mode == "online":
+                self.open_lobby()
+            else:
+                self.state = "menu"
+
+    # ── menu ───────────────────────────────────────────────────
+    def state_menu(self, events):
+        for e in events:
+            for (mode, _label), b in zip(MODES, self.mode_btns):
+                if b.clicked(e):
+                    self.mode = mode
+            for i, r in enumerate(self.card_rects):
+                if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and r.collidepoint(e.pos):
+                    self.selected_map = i
+            if self.mode in ("ai", "aivai"):
+                for d, b in zip(DIFFICULTIES, self.diff_btns):
+                    if b.clicked(e):
+                        self.difficulty = d
+            if self.start_btn.clicked(e) or (e.type == pygame.KEYDOWN and e.key in (pygame.K_RETURN, pygame.K_KP_ENTER)):
+                self.sfx.play("fight", 0.5)
+                if self.mode == "online":
+                    self.open_lobby()
+                else:
+                    self.start_offline(self.mode)
+                return
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif e.key in (pygame.K_LEFT, pygame.K_a):
+                    self.selected_map = (self.selected_map - 1) % len(self.maps)
+                elif e.key in (pygame.K_RIGHT, pygame.K_d):
+                    self.selected_map = (self.selected_map + 1) % len(self.maps)
+            if self.quit_btn.clicked(e):
+                self.running = False
+        self.draw_menu_background()
+        self.draw_menu()
+
+    def draw_menu_background(self):
+        m = self.maps[self.selected_map]
+        self.screen.blit(m.static_layer(), (0, 0))
+        anim = m.animator()
+        anim.update()
+        anim.draw_under(self.screen, self.tick)
+        anim.draw_over(self.screen, self.tick)
+        shade = cached("menu_shade", self._menu_shade)
+        self.screen.blit(shade, (0, 0))
+
+    @staticmethod
+    def _menu_shade():
+        s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        for y in range(HEIGHT):
+            a = int(150 + 70 * abs(y / HEIGHT - 0.42))
+            pygame.draw.line(s, (6, 6, 20, min(235, a)), (0, y), (WIDTH, y))
+        return s
+
+    def draw_menu(self):
+        cx = WIDTH // 2
+        title = banner_text("ARENA FIGHTERS", 104, (235, 225, 255), (140, 100, 255))
+        bob = math.sin(self.tick * 0.03) * 4
+        blit_center(self.screen, title, cx, 112 + bob)
+        draw_text_center(self.screen, "2D arena brawler with a reinforcement-learning AI", get_font(22, bold=False),
+                         (190, 185, 230), (cx, 190))
+
+        draw_text_center(self.screen, "GAME MODE", get_font(18), (170, 165, 220), (cx, 230))
+        for (mode, _label), b in zip(MODES, self.mode_btns):
+            b.draw(self.screen, get_font(26), selected=(mode == self.mode))
+
+        draw_text_center(self.screen, "ARENA", get_font(18), (170, 165, 220), (cx, 368))
+        for i, (r, m) in enumerate(zip(self.card_rects, self.maps)):
+            sel = i == self.selected_map
+            hov = r.collidepoint(mouse_pos())
+            lift = -8 if (sel or hov) else 0
+            rr = r.move(0, lift)
+            if sel:
+                g = rr.inflate(26, 26)
+                gs = pygame.Surface(g.size, pygame.SRCALPHA)
+                pygame.draw.rect(gs, (*m.accent, 90), gs.get_rect(), border_radius=22)
+                self.screen.blit(gs, g.topleft)
+            self.screen.blit(m.thumbnail(r.size), rr.topleft)
+            pygame.draw.rect(self.screen, m.accent if sel else (90, 90, 130), rr, 4 if sel else 2, border_radius=6)
+            label_r = pygame.Rect(rr.x, rr.bottom - 46, rr.width, 46)
+            ls = pygame.Surface(label_r.size, pygame.SRCALPHA)
+            ls.fill((0, 0, 0, 150))
+            self.screen.blit(ls, label_r.topleft)
+            draw_text_center(self.screen, m.name, get_font(24), (255, 255, 255) if sel else (210, 210, 230), label_r.center)
+            draw_text_center(self.screen, MAP_DESCRIPTIONS[i], get_font(17, bold=False), (180, 180, 210),
+                             (r.centerx, r.bottom + 22))
+
+        if self.mode in ("ai", "aivai"):
+            draw_text_center(self.screen, "AI DIFFICULTY", get_font(18), (170, 165, 220), (cx, 690))
+            for d, b in zip(DIFFICULTIES, self.diff_btns):
+                b.draw(self.screen, get_font(24), DIFF_COLORS[d] if d == self.difficulty else (80, 80, 110), selected=(d == self.difficulty))
+        else:
+            draw_text_center(self.screen, MODE_BLURBS[self.mode], get_font(26, bold=False), (215, 210, 245), (cx, 740))
+
+        self.start_btn.text = "CONTINUE" if self.mode == "online" else "START BATTLE"
+        self.start_btn.draw(self.screen, get_font(32), selected=True)
+        self.quit_btn.draw(self.screen, get_font(22))
+
+        # control guide
+        ctrl_r = pygame.Rect(cx - 640, HEIGHT - 116, 1280, 92)
+        draw_panel(self.screen, ctrl_r, (8, 8, 22), 210, 12, (60, 60, 100))
+        rows = [("P1 / solo", "WASD move · LShift sprint · Q dash · F melee · E shoot", (140, 200, 255)),
+                ("P2", "Arrows move · RShift sprint · / dash · RCtrl melee · . shoot", (255, 180, 120))]
+        for li, (tag, txt, col) in enumerate(rows):
+            draw_text_center(self.screen, f"[{tag}]  {txt}", get_font(21, bold=False), col, (cx, ctrl_r.y + 26 + li * 32))
+        foot = get_font(15, bold=False).render(f"F11 fullscreen · M mute · AI: {policy_status()}", True, (130, 130, 170))
+        self.screen.blit(foot, (WIDTH - foot.get_width() - 20, HEIGHT - 24))
+
+    # ── starting / ending matches ──────────────────────────────
+    def start_offline(self, mode):
+        self.session = Session(mode, self.selected_map, self.difficulty)
+        self._reset_fx()
+        self.state = "game"
+
+    def _reset_fx(self):
+        self.particles, self.texts, self.rings = [], [], []
+        self.shake = 0.0
+        self.flash = 0
+
+    def leave_session(self, notify=True, toast=""):
+        s = self.session
+        if s and s.peer:
+            if notify:
+                s.peer.close_gracefully()
+            else:
+                s.peer.close()
+        self.session = None
+        if toast:
+            self.show_toast(toast)
+
+    def back_to_menu(self, toast=""):
+        self.leave_session(notify=True, toast=toast)
+        self.state = "menu"
+
+    # ── online lobby ───────────────────────────────────────────
+    def open_lobby(self):
+        self.state = "lobby"
+        self.lobby_error = ""
+        self.lobby_status = ""
+        if self.scanner is None:
+            self.scanner = LanScanner()
+
+    def _stop_lobby_net(self):
+        if self.connector:
+            self.connector.cancel()
+            self.connector = None
+        if self.beacon:
+            self.beacon.close()
+            self.beacon = None
+        if self.scanner:
+            self.scanner.close()
+            self.scanner = None
+
+    def _relay(self):
+        return self.relay_field.text.strip() or None
+
+    def start_hosting(self):
+        self.lobby_error = ""
+        self.connector = HostConnector(relay=self._relay())
+        self.connect_role = "host"
+        self.handshake_deadline = 0
+        if not self._relay():
+            self.beacon = LanBeacon(dict(port=DEFAULT_PORT, map=self.maps[self.selected_map].name,
+                                         name=platform.node() or "Host"))
+
+    def start_joining(self, target):
+        self.lobby_error = ""
+        if not target.strip():
+            self.lobby_error = "Type the host's IP address (or the room code when using a relay)."
+            return
+        self.connector = JoinConnector(target, relay=self._relay())
+        self.connect_role = "client"
+        self.handshake_deadline = 0
+
+    def cancel_connect(self, error=""):
+        if self.connector:
+            self.connector.cancel()
+            self.connector = None
+        if self.beacon:
+            self.beacon.close()
+            self.beacon = None
+        self.lobby_error = error
+
+    def _poll_connection(self):
+        c = self.connector
+        if c is None:
+            return
+        if self.beacon:
+            self.beacon.tick()
+        if not c.done:
+            return
+        if c.error or c.peer is None:
+            self.cancel_connect(c.error or "Could not connect.")
+            return
+        peer = c.peer
+        if not peer.alive:
+            self.cancel_connect(peer.error or "Connection closed.")
+            return
+        if self.handshake_deadline == 0:
+            self.handshake_deadline = self.tick + 10 * FPS
+            if self.connect_role == "client":
+                peer.send({"t": "hello", "v": PROTOCOL_VERSION})
+        if self.tick > self.handshake_deadline:
+            peer.close()
+            self.cancel_connect("The other side did not answer (different game version?).")
+            return
+        for msg in peer.messages():
+            kind = msg.get("t")
+            if self.connect_role == "host" and kind == "hello":
+                if msg.get("v") != PROTOCOL_VERSION:
+                    peer.send({"t": "reject", "reason": "version mismatch – update the game"})
+                    self.cancel_connect("A player with a different game version tried to join.")
+                    return
+                peer.send({"t": "welcome", "v": PROTOCOL_VERSION, "map": self.selected_map})
+                self._begin_online("host", self.selected_map, peer)
+                return
+            if self.connect_role == "client" and kind == "welcome":
+                self._begin_online("client", int(msg.get("map", 0)), peer)
+                return
+            if kind == "reject":
+                peer.close()
+                self.cancel_connect("Host refused: " + msg.get("reason", ""))
+                return
+
+    def _begin_online(self, role, map_index, peer):
+        self.connector = None
+        self._stop_lobby_net()
+        self.session = Session(role, map_index, peer=peer)
+        self._reset_fx()
+        self.state = "game"
+        self.sfx.play("pickup")
+
+    def state_lobby(self, events):
+        connecting = self.connector is not None
+        for e in events:
+            if connecting:
+                if self.cancel_btn.clicked(e) or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                    self.cancel_connect()
+                continue
+            enter_relay = self.relay_field.handle(e)
+            enter_addr = self.addr_field.handle(e)
+            if self.host_btn.clicked(e) or enter_relay:
+                self.start_hosting()
+            elif self.join_btn.clicked(e) or enter_addr:
+                self.start_joining(self.addr_field.text)
+            elif self.back_btn.clicked(e) or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE and not self._typing()):
+                self._stop_lobby_net()
+                self.state = "menu"
+                return
+            for b, game in self.lan_buttons:
+                if b.clicked(e):
+                    self.relay_field.text = ""
+                    self.addr_field.text = game["addr"]
+                    self.start_joining(game["addr"])
+        self._poll_connection()
+        if self.state != "lobby":
+            return
+
+        self.draw_menu_background()
+        cx = WIDTH // 2
+        blit_center(self.screen, banner_text("PLAY ONLINE", 84, (235, 225, 255), (80, 200, 255)), cx, 110)
+        draw_text_center(self.screen, f"Arena: {self.maps[self.selected_map].name}  (the host's choice is used)",
+                         get_font(22, bold=False), (190, 190, 230), (cx, 190))
+
+        if self.connector is not None:
+            c = self.connector
+            panel = pygame.Rect(cx - 520, 300, 1040, 500)
+            draw_panel(self.screen, panel, (10, 10, 28), 225, 18, (110, 100, 200))
+            dots = "." * (1 + (self.tick // 20) % 3)
+            if self.connect_role == "host":
+                if getattr(c, "room", ""):
+                    draw_text_center(self.screen, "ROOM CODE", get_font(26), (180, 180, 230), (cx, 380))
+                    blit_center(self.screen, banner_text(c.room, 110, (255, 240, 160), (255, 170, 40)), cx, 480)
+                    draw_text_center(self.screen, "Give this code to your friend. They type it in the Join box.",
+                                     get_font(22, bold=False), (200, 200, 240), (cx, 580))
+                elif getattr(c, "addresses", None):
+                    draw_text_center(self.screen, "YOUR ADDRESS", get_font(26), (180, 180, 230), (cx, 380))
+                    blit_center(self.screen, banner_text(c.addresses[0], 70, (200, 255, 220), (40, 220, 140)), cx, 465)
+                    draw_text_center(self.screen, "Players on the same network will also see you under 'Games on your network'.",
+                                     get_font(22, bold=False), (200, 200, 240), (cx, 560))
+                    draw_text_center(self.screen, f"Over the internet: forward TCP port {DEFAULT_PORT}, use a VPN like Tailscale, or use a relay server.",
+                                     get_font(19, bold=False), (160, 160, 200), (cx, 600))
+            status = c.status if not c.done else "Connected – starting"
+            draw_text_center(self.screen, status.rstrip("…") + dots, get_font(26, bold=False), (230, 230, 255), (cx, 720))
+            self.cancel_btn.draw(self.screen, get_font(26))
+            return
+
+        self.relay_field.draw(self.screen, self.tick)
+        self.addr_field.draw(self.screen, self.tick)
+        self.join_btn.draw(self.screen, get_font(28))
+        self.host_btn.draw(self.screen, get_font(28))
+        tip = "Host with a relay → you get a room code." if self._relay() else f"Host directly → friends join with your IP (port {DEFAULT_PORT})."
+        draw_text_center(self.screen, tip, get_font(20, bold=False), (180, 200, 190), (cx + 190, 596))
+
+        # LAN games list
+        games = self.scanner.poll() if self.scanner else []
+        lan_r = pygame.Rect(cx - 560, 670, 1120, 250)
+        draw_panel(self.screen, lan_r, (10, 10, 26), 200, 14, (70, 70, 120))
+        draw_text_shadow(self.screen, "GAMES ON YOUR NETWORK", get_font(18), (170, 170, 220), (lan_r.x + 20, lan_r.y + 14))
+        self.lan_buttons = []
+        if not games:
+            msg = "Searching" + "." * (1 + (self.tick // 20) % 3) if self.scanner and self.scanner.sock else "LAN discovery unavailable on this machine"
+            draw_text_center(self.screen, msg, get_font(22, bold=False), (130, 130, 170), lan_r.center)
+        for i, g in enumerate(games[:4]):
+            b = Button(f"{g.get('name', 'Host')}  ·  {g.get('map', '')}  ·  {g['addr']}",
+                       lan_r.x + 20, lan_r.y + 50 + i * 48, lan_r.width - 40, 42, (20, 30, 50), (90, 200, 255))
+            b.draw(self.screen, get_font(20, bold=False))
+            self.lan_buttons.append((b, g))
+        if self.lobby_error:
+            draw_text_center(self.screen, self.lobby_error, get_font(22, bold=False), (255, 120, 120), (cx, 645))
+        self.back_btn.draw(self.screen, get_font(24))
+
+    # ── gameplay ───────────────────────────────────────────────
+    def _gather_inputs(self, allow_input):
+        s = self.session
+        m = s.match
+        keys = pygame.key.get_pressed()
+        fighting = m.phase == "fight"
+        in1 = in2 = NO_INPUT
+        if s.mode == "local" and allow_input:
+            in1, in2 = read_input(keys, SCHEME_P1), read_input(keys, SCHEME_P2)
+        elif s.mode in ("ai", "host") and allow_input:
+            in1 = read_input(keys, SCHEME_SOLO, mouse=True)
+        if s.ai[0] and fighting:
+            in1 = input_from_tuple(s.ai[0].get_input(m.p1, m.p2, m.arena, m.bullets))
+        if s.ai[1] and fighting:
+            in2 = input_from_tuple(s.ai[1].get_input(m.p2, m.p1, m.arena, m.bullets))
+        if s.mode == "host":
+            x, y, sprint, bits = s.peer.take_input()
+            in2 = PlayerInput(max(-1, min(1, x)), max(-1, min(1, y)), sprint,
+                              bool(bits & BTN_DASH), bool(bits & BTN_MELEE), bool(bits & BTN_SHOOT))
+        return in1, in2
+
+    def update_session(self, allow_input=True):
+        """Advance the match one frame (or apply the host's snapshot when we're a client)."""
+        s = self.session
+        if s.peer is not None:
+            for msg in s.peer.messages():      # a goodbye explains the disconnect that follows it
+                if msg.get("t") == "bye":
+                    who = "The host" if s.mode == "client" else "Your opponent"
+                    self.leave_session(notify=False)
+                    self.state = "menu"
+                    self.show_toast(f"{who} left the match.")
+                    return False
+            if not s.peer.alive:
+                self.back_to_menu("Connection lost: " + (s.peer.error or "disconnected"))
+                return False
+        if s.mode == "client":
+            seq, snap = s.peer.latest_state()
+            if snap is not None and seq != s.last_seq:
+                s.match.apply_snapshot(snap)
+                s.last_seq = seq
+            self.handle_events(s.peer.take_events())
+            inp = read_input(pygame.key.get_pressed(), SCHEME_SOLO, mouse=True) if allow_input else NO_INPUT
+            bits = (BTN_DASH if inp.dash else 0) | (BTN_MELEE if inp.melee else 0) | (BTN_SHOOT if inp.shoot else 0)
+            s.peer.send_state({"t": "i", "x": inp.dx, "y": inp.dy, "s": int(bool(inp.sprint)), "b": bits})
+        else:
+            in1, in2 = self._gather_inputs(allow_input)
+            s.match.step(in1, in2)
+            self.handle_events(s.match.events)
+            if s.mode == "host":
+                s.peer.send_state(s.match.snapshot())
+        return True
+
+    def handle_events(self, events):
+        s = self.session
+        for ev in events:
+            kind = ev[0]
+            if kind == "hit":
+                _, x, y, dmg, target, melee = ev
+                for _ in range(16 if melee else 10):
+                    self.particles.append(Particle(x, y, (255, 80, 80), (3, 9), (14, 30), (3, 7)))
+                for _ in range(6):
+                    self.particles.append(Particle(x, y, (255, 230, 180), (4, 10), (8, 16), (2, 4), 0))
+                self.rings.append(Shockwave(x, y, (255, 200, 200), 80 if melee else 60))
+                self.texts.append(FloatingText(f"-{dmg}", x + random.randint(-12, 12), y - 46,
+                                               (255, 90, 90) if melee else (255, 200, 90), 30 if melee else 26))
+                mine = s.local_side() == target
+                self.shake = max(self.shake, (12 if melee else 8) + (4 if mine else 0))
+                if mine:
+                    self.flash = 8
+                self.sfx.play("hit", 0.9 if melee else 0.7)
+            elif kind == "shoot":
+                _, x, y, widx = ev
+                w = WEAPON_TYPES[widx]
+                for _ in range(5):
+                    self.particles.append(Particle(x, y, w.glow, (1, 4), (6, 12), (2, 4), 0))
+                self.sfx.play(f"shoot_{widx}", 0.8)
+            elif kind == "impact":
+                _, x, y, widx = ev
+                w = WEAPON_TYPES[widx]
+                for _ in range(8):
+                    self.particles.append(Particle(x, y, w.glow, (2, 6), (10, 20), (2, 5), 0.1))
+                self.rings.append(Shockwave(x, y, w.glow, 36, 12, 4))
+                self.sfx.play("impact", 0.6)
+            elif kind == "pickup":
+                _, x, y, widx, who = ev
+                w = WEAPON_TYPES[widx]
+                for _ in range(14):
+                    self.particles.append(Particle(x, y, w.glow, (2, 6), (16, 30), (3, 6), -0.05))
+                self.rings.append(Shockwave(x, y, w.glow, 70, 20, 5))
+                self.texts.append(FloatingText(f"+{w.name}", x, y - 50, w.color, 24, 70))
+                self.sfx.play("pickup", 0.8)
+            elif kind == "swing":
+                self.sfx.play("swing", 0.7)
+            elif kind == "dash":
+                self.sfx.play("dash", 0.6)
+            elif kind == "count":
+                self.sfx.play("beep", 0.8)
+            elif kind == "fight":
+                self.sfx.play("fight", 0.8)
+            elif kind == "ko":
+                _, w, reason, x, y = ev
+                if reason == "ko":
+                    for _ in range(40):
+                        self.particles.append(Particle(x, y, random.choice([(255, 80, 80), (255, 220, 90), (255, 255, 255)]),
+                                                       (3, 12), (25, 50), (3, 8), 0.12))
+                    self.rings.append(Shockwave(x, y, (255, 255, 255), 220, 30, 10))
+                    self.shake = 22
+                    self.flash = 14
+                self.sfx.play("ko")
+            elif kind == "over":
+                self.sfx.play("win")
+
+    def update_fx(self):
+        for lst in (self.particles, self.texts, self.rings):
+            for item in lst:
+                item.update()
+            lst[:] = [i for i in lst if i.life > 0]
+        self.shake *= 0.86
+        if self.shake < 0.5:
+            self.shake = 0
+        if self.flash > 0:
+            self.flash -= 1
+
+    def draw_scene(self):
+        s = self.session
+        m = s.match
+        w = self.world
+        m.arena.map.draw(w, self.tick)
+        for pickup in m.arena.weapon_pickups:
+            pickup.draw(w)
+        for ring in self.rings:
+            ring.draw(w)
+        for b in m.bullets:
+            b.draw(w)
+        for p in sorted(m.players(), key=lambda pl: pl.y):
+            if not (m.phase in ("ko", "over") and p.is_dead()) or (self.tick // 4) % 2:
+                p.draw(w)
+        for pt in self.particles:
+            pt.draw(w)
+        for t in self.texts:
+            t.draw(w)
+        m.arena.map.draw_overlay(w, self.tick)
+        if self.shake:
+            ox = int(random.uniform(-self.shake, self.shake))
+            oy = int(random.uniform(-self.shake, self.shake))
+            self.screen.fill((0, 0, 0))
+            self.screen.blit(w, (ox, oy))
+        else:
+            self.screen.blit(w, (0, 0))
+        if self.flash:
+            fl = cached("flash", lambda: self._flat_overlay((255, 40, 40)))
+            fl.set_alpha(int(10 * self.flash))
+            self.screen.blit(fl, (0, 0))
+        draw_game_hud(self.screen, m, s.titles, s.hint(), self.tick)
+        draw_banners(self.screen, m, s.titles)
+
+    @staticmethod
+    def _flat_overlay(color, alpha=255):
+        s = pygame.Surface((WIDTH, HEIGHT))
+        s.fill(color)
+        s.set_alpha(alpha)
+        return s
+
+    def _dim(self, alpha=150):
+        ov = cached(("dim", alpha), lambda: self._flat_overlay((10, 10, 25), alpha))
+        self.screen.blit(ov, (0, 0))
+
+    def state_game(self, events):
+        s = self.session
+        online = s.peer is not None
+        for e in events:
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                if online:
+                    s.leave_prompt = not s.leave_prompt
+                else:
+                    self.state = "pause"
+                    return
+            if online and s.leave_prompt:
+                if self.leave_yes_btn.clicked(e):
+                    self.back_to_menu()
+                    return
+                if self.leave_no_btn.clicked(e):
+                    s.leave_prompt = False
+        if not self.update_session(allow_input=not (online and s.leave_prompt)):
+            return
+        self.update_fx()
+        self.draw_scene()
+        if online and s.leave_prompt:
+            self._dim(160)
+            blit_center(self.screen, banner_text("LEAVE MATCH?", 90, (255, 230, 230), (255, 60, 60)), WIDTH // 2, HEIGHT // 2 - 100)
+            self.leave_yes_btn.draw(self.screen, get_font(26))
+            self.leave_no_btn.draw(self.screen, get_font(26))
+        if s.match.phase == "over":
+            self.state = "over"
+
+    def state_pause(self, events):
+        for e in events:
+            if self.resume_btn.clicked(e) or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                self.state = "game"
+            elif self.pause_menu_btn.clicked(e):
+                self.back_to_menu()
+                return
+            elif self.pause_exit_btn.clicked(e):
+                self.running = False
+        if self.session is None:
+            return
+        self.draw_scene()
+        self._dim(150)
+        blit_center(self.screen, banner_text("PAUSED", 110, (230, 230, 255), (120, 100, 255)), WIDTH // 2, HEIGHT // 2 - 110)
+        draw_text_center(self.screen, "Press Esc to resume", get_font(24, bold=False), (190, 190, 230), (WIDTH // 2, HEIGHT // 2 - 30))
+        self.resume_btn.draw(self.screen, get_font(30))
+        self.pause_menu_btn.draw(self.screen, get_font(30))
+        self.pause_exit_btn.draw(self.screen, get_font(30))
+
+    def state_over(self, events):
+        s = self.session
+        is_client = s.mode == "client"
+        for e in events:
+            if not is_client and (self.rematch_btn.clicked(e) or (e.type == pygame.KEYDOWN and e.key in (pygame.K_RETURN, pygame.K_r))):
+                s.new_match()
+                self._reset_fx()
+                self.state = "game"
+                return
+            if self.menu_btn.clicked(e) or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                self.back_to_menu()
+                return
+            if self.exit_btn.clicked(e):
+                self.running = False
+                return
+        if not self.update_session(allow_input=False):
+            return
+        if is_client and s.match.phase != "over":
+            self._reset_fx()
+            self.state = "game"
+            return
+        if self.tick % 14 == 0:
+            for _ in range(14):
+                self.particles.append(Particle(random.randint(WIDTH // 4, 3 * WIDTH // 4), random.randint(HEIGHT // 5, HEIGHT // 2),
+                                               random.choice([(255, 220, 60), (100, 220, 255), (255, 100, 180), (80, 255, 120)]),
+                                               (2, 7), (30, 60), (3, 7), 0.15))
+        self.update_fx()
+        self.draw_scene()
+        self._dim(165)
+        text, col = s.winner_text()
+        blit_center(self.screen, banner_text(text, 120, col, shade_color(col, -60)), WIDTH // 2, HEIGHT // 2 - 250)
+        m = s.match
+        draw_text_center(self.screen, f"{m.score[0]}  –  {m.score[1]}", get_font(64), (240, 240, 255), (WIDTH // 2, HEIGHT // 2 - 140))
+        # match stats
+        st = m.stats
+        rows = [("Damage dealt", "dmg"), ("Hits landed", "hits"), ("Shots fired", "shots"), ("Weapons picked", "pickups")]
+        panel = pygame.Rect(WIDTH // 2 - 330, HEIGHT // 2 - 95, 660, 200)
+        draw_panel(self.screen, panel, (12, 12, 30), 220, 14, (90, 90, 150))
+        draw_text_center(self.screen, s.titles[0], get_font(20), (130, 205, 255), (panel.x + 110, panel.y + 26))
+        draw_text_center(self.screen, s.titles[1], get_font(20), (255, 180, 110), (panel.right - 110, panel.y + 26))
+        for i, (name, key) in enumerate(rows):
+            y = panel.y + 66 + i * 34
+            draw_text_center(self.screen, name, get_font(20, bold=False), (190, 190, 225), (panel.centerx, y))
+            draw_text_center(self.screen, str(st[0][key]), get_font(22), (240, 240, 255), (panel.x + 110, y))
+            draw_text_center(self.screen, str(st[1][key]), get_font(22), (240, 240, 255), (panel.right - 110, y))
+        if is_client:
+            draw_text_center(self.screen, "Waiting for the host to start a rematch" + "." * (1 + (self.tick // 20) % 3),
+                             get_font(26, bold=False), (220, 220, 255), (WIDTH // 2, HEIGHT // 2 + 165))
+            self.menu_btn.text = "Leave"
+        else:
+            self.menu_btn.text = "Main Menu"
+            self.rematch_btn.draw(self.screen, get_font(30))
+        self.menu_btn.draw(self.screen, get_font(30))
+        self.exit_btn.draw(self.screen, get_font(30))
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Arena Fighters")
+    ap.add_argument("--fullscreen", action="store_true", help="start in fullscreen (F11 toggles)")
+    ap.add_argument("--mode", choices=["menu", "ai", "local", "aivai", "online"], default="menu",
+                    help="skip the menu and start this mode directly")
+    ap.add_argument("--difficulty", choices=["Easy", "Medium", "Hard"], help="AI difficulty")
+    ap.add_argument("--map", type=int, choices=range(4), help="arena index 0-3")
+    ap.add_argument("--relay", help="relay server host:port for online play")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    App(parse_args(argv)).run()
+
 
 if __name__ == "__main__":
     main()

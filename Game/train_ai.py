@@ -17,8 +17,8 @@ What happens
 3. PPO watches the AI play, collects its reward signals, and
    slowly updates the neural network to make better decisions.
 4. Checkpoints are saved every 50 000 steps to ./checkpoints/
-5. The final model is saved as p2_ai.zip — this is what
-   game_with_ai.py will load.
+5. The final model is saved as p2_ai.zip and exported to
+   p2_ai_weights.npz — the numpy-only file the game loads.
 
 Time estimate
 ─────────────
@@ -36,6 +36,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 from game_env import ArenaFightEnv
+from export_ai_weights import export
 
 
 def _get_device():
@@ -134,9 +135,13 @@ def main():
     model.save("p2_ai")
     vec_env.close()
 
+    # ── Export a torch-free copy for the game ───────────────────
+    export("p2_ai.zip", "p2_ai_weights.npz")
+
     print("\n" + "=" * 62)
     print("  Done! Model saved to:  p2_ai.zip")
-    print("  Run the game with:     python game_with_ai.py")
+    print("  Game weights:          p2_ai_weights.npz")
+    print("  Run the game with:     python game.py")
     print("=" * 62)
 
 
