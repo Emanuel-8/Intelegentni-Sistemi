@@ -1,0 +1,27 @@
+{
+  // Terminal → Run Task…
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Инсталирај пакети за играње",
+      "type": "shell",
+      "command": "python -m pip install -r requirements.txt",
+      "options": { "cwd": "${workspaceFolder}/Game" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Инсталирај пакети за тренинг",
+      "type": "shell",
+      "command": "python -m pip install -r requirements-train.txt",
+      "options": { "cwd": "${workspaceFolder}/Game" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Направи .exe",
+      "type": "shell",
+      "command": "python -m pip install pyinstaller && python build_exe.py",
+      "options": { "cwd": "${workspaceFolder}/Game" },
+      "problemMatcher": []
+    }
+  ]
+}
