@@ -1,0 +1,46 @@
+# Builds stand-alone Arena Fighters executables for Windows, macOS and Linux.
+# Run it from the Actions tab ("Run workflow"), or push a tag like v1.0 to
+# also publish a GitHub Release with the zipped builds attached.
+name: Build game
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: Game
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: python build_exe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArenaFighters-${{ runner.os }}
+          path: Game/dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: cd artifacts && for d in */; do zip -qr "${d%/}.zip" "$d"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip

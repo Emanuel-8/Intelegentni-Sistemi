@@ -1,0 +1,67 @@
+{
+  // Run and Debug (Ctrl+Shift+D): pick a configuration and press F5.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🎮 Arena Fighters (мени)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/game.py",
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "🤖 Против AI – Hard",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/game.py",
+      "args": ["--mode", "ai", "--difficulty", "Hard"],
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "👀 AI против AI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/game.py",
+      "args": ["--mode", "aivai", "--difficulty", "Hard"],
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "👥 Двајца на една тастатура",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/game.py",
+      "args": ["--mode", "local"],
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "🌐 Онлајн лоби",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/game.py",
+      "args": ["--mode", "online"],
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "🛰️ Relay сервер (порта 7777)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/relay_server.py",
+      "args": ["--port", "7777"],
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "🏋️ Тренирај AI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/Game/train_ai.py",
+      "cwd": "${workspaceFolder}/Game",
+      "console": "integratedTerminal"
+    }
+  ]
+}
